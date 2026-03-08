@@ -1,0 +1,6 @@
+[package]
+name = "cesa_conn_core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
