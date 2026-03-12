@@ -61,7 +61,7 @@ pub async fn udp_broadcast_presence(message: &str, duration: u64) {
 /// Listens for incoming UDP packets for the given duration.
 /// Returns Some(SocketAddr) if a valid CesaConn device is found,
 /// or None on timeout, socket error, oversized packet, or name mismatch.
-pub async fn udp_find_broadcaster(duration: u64) -> Option<SocketAddr> {
+pub async fn udp_find_broadcaster(duration: u64, message: &str) -> Option<SocketAddr> {
 
     // Cap duration to the allowed maximum
     let duration = if duration > MAX_BROADCAST_DURATION { MAX_BROADCAST_DURATION } else { duration };
@@ -89,7 +89,7 @@ pub async fn udp_find_broadcaster(duration: u64) -> Option<SocketAddr> {
             let name = String::from_utf8_lossy(&buf[..len]);
 
             // Verify the packet comes from a CesaConn device
-            if name.starts_with(&BROADCAST_NAME) {
+            if name.starts_with(&message) {
                 println!("Found device: {} at IP: {}", name, addr.ip());
                 Some(addr)
             } else {
