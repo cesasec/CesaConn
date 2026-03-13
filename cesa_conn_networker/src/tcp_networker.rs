@@ -22,9 +22,7 @@ pub async fn bind_socket(addr: &str) -> TcpListener {
 // TODO : Auth
 pub async fn connection_handler(connection: (TcpStream, SocketAddr)) {
 
-    //AUTH HERE
-    
-
+    //logic here
 }
 
 
@@ -50,5 +48,19 @@ pub async fn recv(addr: &str) {
         };
 
     }
+}
 
+pub async fn connect(addr: &str) {
+    let stream = match TcpStream::connect(addr).await {
+        Ok(s) => {
+            s
+        },
+
+        Err(_) => {
+            eprintln!("Failed to connect!");
+            return
+        }
+    };
+
+    
 }
