@@ -21,7 +21,7 @@ impl fmt::Display for CryptoError {
     }
 }
 
-fn encrypt(key: &[u8; 32], data: &[u8]) -> Result<(Vec<u8>, [u8; 12]), CryptoError> {
+pub fn encrypt(key: &[u8; 32], data: &[u8]) -> Result<(Vec<u8>, [u8; 12]), CryptoError> {
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
 
     let mut nonce_bytes = [0u8; 12];
