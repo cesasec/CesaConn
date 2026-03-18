@@ -1,11 +1,11 @@
 use argon2::Argon2;
 
 #[derive(Debug)]
-pub enum pswdm_errors {
-    hash_failed
+pub enum PswdMErrors {
+    HashFailed
 }
 
-pub fn derive_key(password: &[u8], salt: [u8; 32]) -> Result<[u8; 32], pswdm_errors> {
+pub fn derive_key(password: &[u8], salt: [u8; 32]) -> Result<[u8; 32], PswdmErrors> {
     let mut key = [0u8; 32];
 
     let cipher = Argon2::default();
@@ -17,7 +17,7 @@ pub fn derive_key(password: &[u8], salt: [u8; 32]) -> Result<[u8; 32], pswdm_err
         },
         Err(_) => {
             eprintln!("Failed to hash password!!!");
-            return Err(pswdm_errors::hash_failed)
+            return Err(PswdMErrors::HashFailed)
         }
     };
 }
