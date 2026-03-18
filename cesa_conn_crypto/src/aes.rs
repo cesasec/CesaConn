@@ -1,7 +1,6 @@
-use core::fmt;
-
 use aes_gcm::{Aes256Gcm, Key, Nonce};
 use aes_gcm::aead::{Aead, KeyInit};
+
 use rand::TryRng;
 use rand::rngs::SysRng;
 
