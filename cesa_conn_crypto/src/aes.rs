@@ -16,16 +16,6 @@ pub enum AESError {
     DecryptionFailed,
 }
 
-impl fmt::Display for AESError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            AESError::NonceFailed      => write!(f, "Failed to generate nonce"),
-            AESError::EncryptionFailed => write!(f, "Encryption failed"),
-            AESError::DecryptionFailed => write!(f, "Decryption failed — data may be corrupted or tampered"),
-        }
-    }
-}
-
 /// Encrypts data using AES-256-GCM with a randomly generated nonce.
 /// Returns the ciphertext and the nonce — both are required for decryption.
 pub fn encrypt(key: &[u8; 32], data: &[u8]) -> Result<(Vec<u8>, [u8; 12]), AESError> {
