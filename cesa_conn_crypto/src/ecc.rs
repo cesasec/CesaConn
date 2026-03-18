@@ -35,14 +35,18 @@ pub fn generate_signing_key() -> Result<[u8; 32], ECCErrors> {
 /// Derives the Ed25519 verifying (public) key from a signing key
 pub fn calculate_verifying_key(signing_key: &[u8; 32]) -> [u8; 32] {
     let signing_key = SigningKey::from_bytes(signing_key);
-    signing_key.verifying_key().to_bytes()
+    let veryfing_key = signing_key.verifying_key();
+
+    veryfing_key.to_bytes()
 }
 
 /// Signs data using Ed25519 — returns a 64-byte signature
 /// Signature should be verified by the receiver before trusting the data
 pub fn sign(signing_key: &[u8; 32], data: &[u8]) -> [u8; 64] {
     let signing_key = SigningKey::from_bytes(signing_key);
-    signing_key.sign(data).to_bytes()
+    let signed_data = signing_key.sign(data);
+    
+    signed_data.to_bytes()
 }
 
 /// Verifies an Ed25519 signature against data and a verifying key
