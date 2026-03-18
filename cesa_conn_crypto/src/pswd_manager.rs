@@ -16,7 +16,7 @@ pub fn derive_key(password: &[u8], salt: [u8; 32]) -> Result<[u8; 32], pswdm_err
             return Ok(key)
         },
         Err(_) => {
-            eprintln!("Failed to hash password!!!")
+            eprintln!("Failed to hash password!!!");
             return Err(pswdm_errors::hash_failed)
         }
     };
