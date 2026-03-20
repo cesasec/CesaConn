@@ -4,6 +4,11 @@ use tokio::time::{sleep, timeout, Duration};
 
 use core::net::SocketAddr;
 
+#[derive(Debug)]
+pub enum UdpNetworkerErrors {
+    FailedToBindSocket
+}
+
 /// Maximum allowed duration for broadcast/listening operations in seconds
 pub static MAX_BROADCAST_DURATION: u64 = 20;
 
@@ -12,16 +17,9 @@ pub static BROADCAST_NAME: &str = "CesaConn Brodcast";
 
 /// Binds a UDP socket to the given address and returns it.
 /// Panics if binding fails — intentional, as the app cannot function without a socket.
-pub async fn bind_socket(addr: &str) -> UdpSocket {
-    match UdpSocket::bind(addr).await {
-        Ok(s) => {
-            println!("Succesfully binded socket.");
-            s
-        },
-        Err(e) => {
-            panic!("Failed to bind socket! | Error: {}", e)
-        }
-    }
+pub async fn bind_socket(addr: &str) -> Result<UdpSocket, UdpNetworkerErrors> {
+    UdpSocket::bind(addr).await
+    .map_err(|_| UdpNetworkerErrors::FailedToBindSocket)
 }
 
 /// Broadcasts a UDP presence message every second for the given duration.
@@ -30,7 +28,7 @@ pub async fn udp_broadcast_presence(message: &str, duration: u64) {
 
     // Cap duration to the allowed maximum
     let duration = if duration > MAX_BROADCAST_DURATION { MAX_BROADCAST_DURATION } else { duration };
-    let socket = bind_socket("0.0.0.0:6363").await;
+    let socket = bind_socket("0.0.0.0:6363").await.unwrap();
 
     // Enable broadcast mode — required for sending to 255.255.255.255
     match socket.set_broadcast(true) {
@@ -67,7 +65,7 @@ pub async fn udp_find_broadcaster(duration: u64, message: &str) -> Option<Socket
     // Cap duration to the allowed maximum
     let duration = if duration > MAX_BROADCAST_DURATION { MAX_BROADCAST_DURATION } else { duration };
 
-    let socket = bind_socket("0.0.0.0:6363").await;
+    let socket = bind_socket("0.0.0.0:6363").await.unwrap();
     let mut buf = [0; 1024]; // Receive buffer — max 1024 bytes
 
     println!("Searching for devices on network...");
@@ -120,7 +118,7 @@ mod tests {
     /// Test that bind_socket successfully binds to a valid address
     #[tokio::test]
     async fn test_bind_socket_valid() {
-        let socket = bind_socket("0.0.0.0:0").await; // port 0 = OS picks random port
+        let socket = bind_socket("0.0.0.0:0").await.unwrap(); // port 0 = OS picks random port
         assert!(socket.local_addr().is_ok());
     }
 
@@ -165,7 +163,7 @@ mod tests {
 
         // Broadcast with wrong name
         tokio::spawn(async {
-            let socket = bind_socket("0.0.0.0:6363").await;
+            let socket = bind_socket("0.0.0.0:6363").await.unwrap();
             socket.set_broadcast(true).unwrap();
             socket.send_to(b"UnknownDevice", "255.255.255.255:6363").await.unwrap();
         });
@@ -182,7 +180,7 @@ mod tests {
     async fn test_oversized_packet_rejected() {
 
         tokio::spawn(async {
-            let socket = bind_socket("0.0.0.0:0").await;
+            let socket = bind_socket("0.0.0.0:0").await.unwrap();
             socket.set_broadcast(true).unwrap();
 
             // Send packet larger than buffer (1024 bytes)
