@@ -42,7 +42,7 @@ impl fmt::Display for UdpNetworkerErrors {
 pub static MAX_BROADCAST_DURATION: u64 = 20;
 
 /// Identifier name used to recognize CesaConn devices on the network
-pub static BROADCAST_NAME: &str = "CesaConn Brodcast";
+pub static BROADCAST_NAME: &str = "CesaConn Broadcast";
 
 /// Broadcasts a UDP presence message every second for the given duration.
 /// Duration is capped at MAX_BROADCAST_DURATION to prevent indefinite broadcasting.
@@ -101,7 +101,7 @@ pub async fn udp_broadcast_presence(
 pub async fn udp_find_broadcaster(
     duration: u64,
     message: &[u8],
-    known_addrs: Arc<Mutex<Vec<SocketAddr>>>
+    known_addrs: Arc<Mutex<Vec<SocketAddr>>>,
 ) -> Result<SocketAddr, UdpNetworkerErrors> {
     // Cap duration to the allowed maximum
     let duration = if duration > MAX_BROADCAST_DURATION {
@@ -132,8 +132,8 @@ pub async fn udp_find_broadcaster(
         return Err(UdpNetworkerErrors::DataTooBig);
     }
 
-    // TODO DECRYPT
-    
+    // TODO: DECRYPT
+
     // Convert received bytes to string for device name comparison
     let name = &buf[..len];
 
@@ -152,6 +152,11 @@ mod tests {
     use super::*;
     use tokio::net::UdpSocket;
 
+    /// Helper that returns an empty known_addrs list wrapped in Arc<Mutex>
+    fn empty_known_addrs() -> Arc<Mutex<Vec<SocketAddr>>> {
+        Arc::new(Mutex::new(vec![]))
+    }
+
     /// Test that UdpSocket::bind successfully binds to a valid address
     #[tokio::test]
     async fn test_bind_socket() {
@@ -159,7 +164,7 @@ mod tests {
         assert!(socket.local_addr().is_ok());
     }
 
-    /// Test that duration cap works
+    /// Test that duration cap works correctly
     #[tokio::test]
     async fn test_duration_cap() {
         let over_limit = MAX_BROADCAST_DURATION + 100;
@@ -174,27 +179,30 @@ mod tests {
     /// Test that udp_find_broadcaster times out when no broadcaster is present
     #[tokio::test]
     async fn test_find_broadcaster_timeout() {
-        let result = udp_find_broadcaster(1, BROADCAST_NAME).await;
+        let result = udp_find_broadcaster(1, BROADCAST_NAME.as_bytes(), empty_known_addrs()).await;
         assert!(result.is_err());
         assert!(matches!(result, Err(UdpNetworkerErrors::Timeout)));
     }
 
-    /// Test that unknown broadcast name is rejected
+    /// Test that an unknown broadcast name is rejected
     #[tokio::test]
     async fn test_unknown_device_rejected() {
         tokio::spawn(async {
-            let socket = UdpSocket::bind("0.0.0.0:6363").await.unwrap();
+            let socket = UdpSocket::bind("0.0.0.0:0").await.unwrap();
             socket.set_broadcast(true).unwrap();
             socket.send_to(b"UnknownDevice", "255.255.255.255:6363").await.unwrap();
         });
 
         sleep(Duration::from_millis(100)).await;
 
-        let result = udp_find_broadcaster(1, BROADCAST_NAME).await;
-        assert!(matches!(result, Err(UdpNetworkerErrors::UnknownDevice) | Err(UdpNetworkerErrors::Timeout)));
+        let result = udp_find_broadcaster(1, BROADCAST_NAME.as_bytes(), empty_known_addrs()).await;
+        assert!(matches!(
+            result,
+            Err(UdpNetworkerErrors::UnknownDevice) | Err(UdpNetworkerErrors::Timeout)
+        ));
     }
 
-    /// Test that oversized packet is rejected
+    /// Test that an oversized packet is rejected
     #[tokio::test]
     async fn test_oversized_packet_rejected() {
         tokio::spawn(async {
@@ -206,15 +214,68 @@ mod tests {
 
         sleep(Duration::from_millis(100)).await;
 
-        let result = udp_find_broadcaster(1, BROADCAST_NAME).await;
-        assert!(matches!(result, Err(UdpNetworkerErrors::DataTooBig) | Err(UdpNetworkerErrors::Timeout) | Err(UdpNetworkerErrors::UnknownDevice)));
+        let result = udp_find_broadcaster(1, BROADCAST_NAME.as_bytes(), empty_known_addrs()).await;
+        assert!(matches!(
+            result,
+            Err(UdpNetworkerErrors::DataTooBig)
+                | Err(UdpNetworkerErrors::Timeout)
+                | Err(UdpNetworkerErrors::UnknownDevice)
+        ));
     }
 
-    /// Test Display for all error variants
+    /// Test that known_addrs can hold multiple addresses simultaneously
+    #[tokio::test]
+    async fn test_known_addrs_holds_multiple_entries() {
+        let known_addrs: Arc<Mutex<Vec<SocketAddr>>> = Arc::new(Mutex::new(vec![
+            "192.168.1.1:6363".parse().unwrap(),
+            "192.168.1.2:6363".parse().unwrap(),
+            "10.0.0.1:6363".parse().unwrap(),
+        ]));
+
+        let addrs = known_addrs.lock().await;
+        assert_eq!(addrs.len(), 3);
+        assert!(addrs.contains(&"192.168.1.2:6363".parse::<SocketAddr>().unwrap()));
+    }
+
+    /// Test that known_addrs is accessible from multiple tasks via Arc::clone
+    #[tokio::test]
+    async fn test_known_addrs_arc_clone() {
+        let known_addrs = Arc::new(Mutex::new(vec![
+            "192.168.0.1:6363".parse::<SocketAddr>().unwrap(),
+        ]));
+
+        let clone = Arc::clone(&known_addrs);
+
+        tokio::spawn(async move {
+            let addrs = clone.lock().await;
+            assert_eq!(addrs.len(), 1);
+        })
+        .await
+        .unwrap();
+    }
+
+    /// Test that known_addrs is not mutated by udp_find_broadcaster on timeout
+    #[tokio::test]
+    async fn test_known_addrs_not_mutated_on_timeout() {
+        let known_addrs = Arc::new(Mutex::new(vec![
+            "192.168.1.1:6363".parse::<SocketAddr>().unwrap(),
+        ]));
+
+        let _ = udp_find_broadcaster(1, BROADCAST_NAME.as_bytes(), Arc::clone(&known_addrs)).await;
+
+        let addrs = known_addrs.lock().await;
+        assert_eq!(addrs.len(), 1);
+    }
+
+    /// Test Display implementation for all error variants
     #[test]
     fn test_error_display() {
         assert!(!UdpNetworkerErrors::FailedToBindSocket.to_string().is_empty());
+        assert!(!UdpNetworkerErrors::FailedToSetBroadcastMode.to_string().is_empty());
+        assert!(!UdpNetworkerErrors::FailedToSendBroadcast.to_string().is_empty());
         assert!(!UdpNetworkerErrors::Timeout.to_string().is_empty());
+        assert!(!UdpNetworkerErrors::FailedToFetchResult.to_string().is_empty());
+        assert!(!UdpNetworkerErrors::DataTooBig.to_string().is_empty());
         assert!(!UdpNetworkerErrors::UnknownDevice.to_string().is_empty());
     }
 }

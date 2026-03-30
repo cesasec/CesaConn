@@ -17,14 +17,14 @@ pub static BUFFER_SIZE: usize = 4096;
 
 // TODO : Auth
 pub async fn recv_handler(
-    listener: &TcpListener,
-    addr: &str,
+    listener: Arc<Mutex<TcpListener>>,
+    incoming_connection: (TcpStream, SocketAddr),
     key: Arc<Mutex<[u8; 32]>>,
     trusted_addrs: Arc<Mutex<Vec<SocketAddr>>>,
-    cancellation_token: &CancellationToken,
+    cancellation_token: Arc<Mutex<CancellationToken>>,
 ) {
 
-    //logic here
+    
 }
 
 // TODO : Auth
@@ -42,14 +42,22 @@ pub async fn recv(
     addr: &str,
     key: Arc<Mutex<[u8; 32]>>,
     trusted_addrs: Arc<Mutex<Vec<SocketAddr>>>,
-    cancellation_token: &CancellationToken,
+    cancellation_token: Arc<Mutex<CancellationToken>>,
 ) -> Result<(), TcpNetworkerErrors> {
-    let cloned_token = cancellation_token.clone();
 
     println!("Listening on: {addr}");
 
     loop {
+        let listener_clone = Arc::clone(&listener);
+        let key_clone = Arc::clone(&key);
+        let trusted_addrs_clone = Arc::clone(&trusted_addrs);
+        let cancellation_token_clone = Arc::clone(&cancellation_token);
+
+        let cloned_token = cancellation_token.lock().await.clone();
+
         let incoming_connection = listener
+            .lock()
+            .await
             .accept()
             .await
             .map_err(|_| TcpNetworkerErrors::FailedToAcceptConnection)?;
@@ -61,7 +69,7 @@ pub async fn recv(
                 println!("Cancelled");
                 5
                 },
-                _ = recv_handler(incoming_connection, key, trusted_addrs) => {
+                _ = recv_handler(listener_clone, incoming_connection, key_clone, trusted_addrs_clone, cancellation_token_clone) => {
                     println!("Finished");
                     99
                 }
@@ -73,16 +81,5 @@ pub async fn recv(
 }
 
 pub async fn connect(addr: &str) {
-    match TcpStream::connect(addr).await {
-        Ok(s) => {
-            let addr: SocketAddr = addr.parse().unwrap();
-            let connection = (s, addr);
-
-            tokio::spawn(async move { connect_handler(connection).await });
-        }
-
-        Err(_) => {
-            eprintln!("Failed to connect!");
-        }
-    };
+   
 }
