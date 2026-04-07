@@ -2,7 +2,7 @@ use core::fmt;
 use core::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
-use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 use tokio::time::{Duration, sleep, timeout};
 
 /// Errors that can occur during UDP networking operations
@@ -108,7 +108,7 @@ pub async fn udp_broadcast_presence(
 pub async fn udp_find_broadcaster(
     duration: u64,
     message: &[u8],
-    known_addrs: Arc<Mutex<Vec<SocketAddr>>>,
+    known_addrs: Arc<RwLock<Vec<SocketAddr>>>,
 ) -> Result<SocketAddr, UdpNetworkerErrors> {
     // Cap duration to the allowed maximum
     let duration = if duration > MAX_BROADCAST_DURATION {
@@ -135,7 +135,7 @@ pub async fn udp_find_broadcaster(
     let (len, addr) = match recv_result {
         Ok(v) => v,
         Err(e) => {
-            
+
             #[cfg(windows)]
             if e.raw_os_error() == Some(10040) {
                 return Err(UdpNetworkerErrors::DataTooBig)
@@ -175,9 +175,9 @@ mod tests {
     use super::*;
     use tokio::net::UdpSocket;
 
-    /// Helper that returns an empty known_addrs list wrapped in Arc<Mutex>
-    fn empty_known_addrs() -> Arc<Mutex<Vec<SocketAddr>>> {
-        Arc::new(Mutex::new(vec![]))
+    /// Helper that returns an empty known_addrs list wrapped in Arc<RwLock>
+    fn empty_known_addrs() -> Arc<RwLock<Vec<SocketAddr>>> {
+        Arc::new(RwLock::new(vec![]))
     }
 
     /// Test that UdpSocket::bind successfully binds to a valid address
@@ -246,13 +246,13 @@ mod tests {
     /// Test that known_addrs can hold multiple addresses simultaneously
     #[tokio::test]
     async fn test_known_addrs_holds_multiple_entries() {
-        let known_addrs: Arc<Mutex<Vec<SocketAddr>>> = Arc::new(Mutex::new(vec![
+        let known_addrs: Arc<RwLock<Vec<SocketAddr>>> = Arc::new(RwLock::new(vec![
             "192.168.1.1:6363".parse().unwrap(),
             "192.168.1.2:6363".parse().unwrap(),
             "10.0.0.1:6363".parse().unwrap(),
         ]));
 
-        let addrs = known_addrs.lock().await;
+        let addrs = known_addrs.read().await;
         assert_eq!(addrs.len(), 3);
         assert!(addrs.contains(&"192.168.1.2:6363".parse::<SocketAddr>().unwrap()));
     }
@@ -260,14 +260,14 @@ mod tests {
     /// Test that known_addrs is accessible from multiple tasks via Arc::clone
     #[tokio::test]
     async fn test_known_addrs_arc_clone() {
-        let known_addrs = Arc::new(Mutex::new(vec![
+        let known_addrs = Arc::new(RwLock::new(vec![
             "192.168.0.1:6363".parse::<SocketAddr>().unwrap(),
         ]));
 
         let clone = Arc::clone(&known_addrs);
 
         tokio::spawn(async move {
-            let addrs = clone.lock().await;
+            let addrs = clone.read().await;
             assert_eq!(addrs.len(), 1);
         })
         .await
@@ -277,13 +277,13 @@ mod tests {
     /// Test that known_addrs is not mutated by udp_find_broadcaster on timeout
     #[tokio::test]
     async fn test_known_addrs_not_mutated_on_timeout() {
-        let known_addrs = Arc::new(Mutex::new(vec![
+        let known_addrs = Arc::new(RwLock::new(vec![
             "192.168.1.1:6363".parse::<SocketAddr>().unwrap(),
         ]));
 
         let _ = udp_find_broadcaster(1, BROADCAST_NAME.as_bytes(), Arc::clone(&known_addrs)).await;
 
-        let addrs = known_addrs.lock().await;
+        let addrs = known_addrs.read().await;
         assert_eq!(addrs.len(), 1);
     }
 

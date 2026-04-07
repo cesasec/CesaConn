@@ -24,13 +24,12 @@ pub async fn recv_handler(
     trusted_addrs: Arc<RwLock<Vec<SocketAddr>>>,
     cancellation_token: Arc<RwLock<CancellationToken>>,
 ) {
-    
 }
 
 // TODO : Auth
 pub async fn connect_handler(
     connection: (TcpStream, SocketAddr),
-    a_key:  Arc<RwLock<[u8; 32]>>,
+    a_key: Arc<RwLock<[u8; 32]>>,
     d_key: Arc<RwLock<[u8; 32]>>,
     trusted_addrs: &mut Vec<u8>,
 ) {
@@ -49,13 +48,20 @@ pub async fn recv(
     println!("Listening on: {addr}");
 
     loop {
+
+        let cancellation_token_clone = Arc::clone(&cancellation_token);
+
+        let cloned_token = cancellation_token.read().await.clone();
+
+        if cloned_token.is_cancelled() {
+            println!("Quitting...");
+            break;
+        }
+
         let listener_clone = Arc::clone(&listener);
         let a_key_clone = Arc::clone(&a_key);
         let d_key_clone = Arc::clone(&d_key);
         let trusted_addrs_clone = Arc::clone(&trusted_addrs);
-        let cancellation_token_clone = Arc::clone(&cancellation_token);
-
-        let cloned_token = cancellation_token.read().await.clone();
 
         let incoming_connection = listener
             .read()
@@ -63,11 +69,6 @@ pub async fn recv(
             .accept()
             .await
             .map_err(|_| TcpNetworkerErrors::FailedToAcceptConnection)?;
-
-        if cloned_token.is_cancelled() {
-            println!("Quitting...");
-            break;
-        }
 
         tokio::spawn(async move {
             select! {
