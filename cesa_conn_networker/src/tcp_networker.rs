@@ -2,7 +2,7 @@ use core::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::select;
-use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug)]
@@ -17,11 +17,11 @@ pub static BUFFER_SIZE: usize = 4096;
 
 // TODO : Auth
 pub async fn recv_handler(
-    listener: Arc<Mutex<TcpListener>>,
+    listener: Arc<RwLock<TcpListener>>,
     incoming_connection: (TcpStream, SocketAddr),
-    key: Arc<Mutex<[u8; 32]>>,
-    trusted_addrs: Arc<Mutex<Vec<SocketAddr>>>,
-    cancellation_token: Arc<Mutex<CancellationToken>>,
+    key: Arc<RwLock<[u8; 32]>>,
+    trusted_addrs: Arc<RwLock<Vec<SocketAddr>>>,
+    cancellation_token: Arc<RwLock<CancellationToken>>,
 ) {
     
 }
@@ -37,11 +37,11 @@ pub async fn connect_handler(
 }
 
 pub async fn recv(
-    listener: Arc<Mutex<TcpListener>>,
+    listener: Arc<RwLock<TcpListener>>,
     addr: &str,
-    key: Arc<Mutex<[u8; 32]>>,
-    trusted_addrs: Arc<Mutex<Vec<SocketAddr>>>,
-    cancellation_token: Arc<Mutex<CancellationToken>>,
+    key: Arc<RwLock<[u8; 32]>>,
+    trusted_addrs: Arc<RwLock<Vec<SocketAddr>>>,
+    cancellation_token: Arc<RwLock<CancellationToken>>,
 ) -> Result<(), TcpNetworkerErrors> {
     println!("Listening on: {addr}");
 
@@ -51,10 +51,10 @@ pub async fn recv(
         let trusted_addrs_clone = Arc::clone(&trusted_addrs);
         let cancellation_token_clone = Arc::clone(&cancellation_token);
 
-        let cloned_token = cancellation_token.lock().await.clone();
+        let cloned_token = cancellation_token.read().await.clone();
 
         let incoming_connection = listener
-            .lock()
+            .read()
             .await
             .accept()
             .await
