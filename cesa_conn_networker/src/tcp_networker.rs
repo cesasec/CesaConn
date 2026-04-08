@@ -48,10 +48,12 @@ pub enum TcpNetworkerErrors {
 impl fmt::Display for TcpNetworkerErrors {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            TcpNetworkerErrors::FailedToAcceptConnection => write!(f, "failed to accept connection"),
-            TcpNetworkerErrors::FailedToReadFromStream   => write!(f, "failed to read from stream"),
-            TcpNetworkerErrors::FailedToAuthenticate     => write!(f, "authentication failed"),
-            TcpNetworkerErrors::FailedToDecryptTunnel    => write!(f, "failed to decrypt tunnel data"),
+            TcpNetworkerErrors::FailedToAcceptConnection => {
+                write!(f, "failed to accept connection")
+            }
+            TcpNetworkerErrors::FailedToReadFromStream => write!(f, "failed to read from stream"),
+            TcpNetworkerErrors::FailedToAuthenticate => write!(f, "authentication failed"),
+            TcpNetworkerErrors::FailedToDecryptTunnel => write!(f, "failed to decrypt tunnel data"),
         }
     }
 }
@@ -185,24 +187,22 @@ pub async fn recv(
 
         let cloned_token = cancellation_token.read().await.clone();
 
-        // Check for cancellation before blocking on accept()
-        if cloned_token.is_cancelled() {
-            println!("Quitting...");
-            break;
-        }
-
         // Clone Arcs so the spawned task owns its own references
         let listener_clone = Arc::clone(&listener);
         let a_key_clone = Arc::clone(&a_key);
         let d_key_clone = Arc::clone(&d_key);
         let trusted_addrs_clone = Arc::clone(&trusted_addrs);
 
-        let incoming_connection = listener
-            .read()
-            .await
-            .accept()
-            .await
-            .map_err(|_| TcpNetworkerErrors::FailedToAcceptConnection)?;
+        let guard = listener.read().await;
+        let incoming_connection = select! {
+            _ = cloned_token.cancelled() => {
+                println!("Quitting...");
+                break;
+            },
+            result = guard.accept() => {
+                result.map_err(|_| TcpNetworkerErrors::FailedToAcceptConnection)?
+            }
+        };
 
         tokio::spawn(async move {
             select! {
@@ -224,8 +224,10 @@ pub async fn recv(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cesa_conn_crypto::ecdh::{calculate_public_key, calculate_shared_key, generate_private_key, hash_key};
     use crate::auth::encrypt_tunnel;
+    use cesa_conn_crypto::ecdh::{
+        calculate_public_key, calculate_shared_key, generate_private_key, hash_key,
+    };
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
 
@@ -281,10 +283,14 @@ mod tests {
         stream.read_exact(recv_buf).await.unwrap();
 
         let recv_nonce: [u8; 12] = recv_buf[0..12].try_into().unwrap();
-        let recv_plaintext = cesa_conn_crypto::aes::decrypt(&shared_hash, &recv_buf[12..], &recv_nonce).unwrap();
+        let recv_plaintext =
+            cesa_conn_crypto::aes::decrypt(&shared_hash, &recv_buf[12..], &recv_nonce).unwrap();
 
         let confirmed = recv_plaintext == auth_key;
-        stream.write_all(&[if confirmed { 0x01 } else { 0x00 }]).await.unwrap();
+        stream
+            .write_all(&[if confirmed { 0x01 } else { 0x00 }])
+            .await
+            .unwrap();
 
         shared_hash
     }
@@ -303,7 +309,15 @@ mod tests {
 
         drop(client); // not needed — server rejects before reading anything
 
-        let result = recv_handler(listener_arc, (server, peer_addr), a_key, d_key, trusted, token).await;
+        let result = recv_handler(
+            listener_arc,
+            (server, peer_addr),
+            a_key,
+            d_key,
+            trusted,
+            token,
+        )
+        .await;
 
         // Untrusted address returns Ok(()) — graceful rejection, not an error
         assert!(result.is_ok());
@@ -322,8 +336,19 @@ mod tests {
 
         drop(client); // close immediately — auth read_exact will fail
 
-        let result = recv_handler(listener_arc, (server, peer_addr), a_key, d_key, trusted, token).await;
-        assert_eq!(result.unwrap_err(), TcpNetworkerErrors::FailedToAuthenticate);
+        let result = recv_handler(
+            listener_arc,
+            (server, peer_addr),
+            a_key,
+            d_key,
+            trusted,
+            token,
+        )
+        .await;
+        assert_eq!(
+            result.unwrap_err(),
+            TcpNetworkerErrors::FailedToAuthenticate
+        );
     }
 
     /// Full happy path — auth succeeds, init header and data packet are read and decrypted.
@@ -362,7 +387,15 @@ mod tests {
             client.write_all(&outer).await.unwrap();
         });
 
-        let result = recv_handler(listener_arc, (server, peer_addr), a_key, d_key, trusted, token).await;
+        let result = recv_handler(
+            listener_arc,
+            (server, peer_addr),
+            a_key,
+            d_key,
+            trusted,
+            token,
+        )
+        .await;
         client_task.await.unwrap();
 
         assert!(result.is_ok());
