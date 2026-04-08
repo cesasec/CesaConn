@@ -176,20 +176,6 @@ mod tests {
         (Arc::new(RwLock::new(key)), Arc::new(RwLock::new(trusted)))
     }
 
-    /// Builds the 60-byte encrypted payload a client sends after its public key.
-    /// server_pub_key must be the server's known static public key.
-    fn build_client_payload(server_pub_key: &[u8; 32], auth_key: &[u8; 32]) -> ([u8; 32], Vec<u8>) {
-        let client_priv = generate_private_key();
-        let client_pub = calculate_public_key(&client_priv);
-        let shared = calculate_shared_key(&client_priv, server_pub_key);
-        let shared_hash = hash_key(&shared);
-        let (ciphertext, nonce) = encrypt(&shared_hash, auth_key).unwrap();
-        let mut payload = Vec::with_capacity(60);
-        payload.extend_from_slice(&nonce); // bytes  0..12
-        payload.extend_from_slice(&ciphertext); // bytes 12..60
-        (client_pub, payload)
-    }
-
     /// Connection from an address not in the trusted list must be rejected immediately.
     #[tokio::test]
     async fn test_untrusted_addr_rejected() {
@@ -258,12 +244,91 @@ mod tests {
         assert_eq!(result.unwrap_err(), AuthErrors::FailedToDecrypt);
     }
 
-    // NOTE: A full happy-path test (correct key → auth success) is not yet possible because
-    // auth_incoming never sends the server's ephemeral public key back to the client.
-    // The client needs it to compute the shared secret and encrypt the pre-shared key.
-    // Once the protocol is fixed (see TODO in auth_incoming), add tests here:
-    //   test_correct_key_auth_success
-    //   test_wrong_key_auth_failure
+    /// Simulates the full client side of the handshake:
+    ///   1. Send client pubkey
+    ///   2. Read server pubkey
+    ///   3. Compute shared secret, encrypt auth_key, send nonce + ciphertext
+    async fn run_client(mut stream: TcpStream, auth_key: [u8; 32]) {
+        let client_priv = generate_private_key();
+        let client_pub = calculate_public_key(&client_priv);
+
+        // Step 1: send our public key
+        stream.write_all(&client_pub).await.unwrap();
+
+        // Step 2: read server's public key
+        let server_pub = &mut [0u8; 32];
+        stream.read_exact(server_pub).await.unwrap();
+
+        // Step 3: derive shared secret and encrypt the auth key
+        let shared = calculate_shared_key(&client_priv, server_pub);
+        let shared_hash = hash_key(&shared);
+        let (ciphertext, nonce) = encrypt(&shared_hash, &auth_key).unwrap();
+
+        // Send nonce (12 bytes) followed by ciphertext (48 bytes)
+        stream.write_all(&nonce).await.unwrap();
+        stream.write_all(&ciphertext).await.unwrap();
+    }
+
+    /// Correct pre-shared key and trusted address must result in successful authentication.
+    #[tokio::test]
+    async fn test_correct_key_auth_success() {
+        let (mut server, client, peer_addr) = setup_tcp_pair().await;
+        let (key, trusted) = make_shared_state(TEST_KEY, vec![peer_addr]);
+
+        // Run the client handshake concurrently — server and client must run in parallel
+        // because both sides block waiting for the other to send/receive
+        let client_task = tokio::spawn(run_client(client, TEST_KEY));
+
+        let result = auth_incoming(key, trusted, (&mut server, peer_addr)).await;
+
+        client_task.await.unwrap();
+
+        let (authenticated, _pub_key, shared_key_hash) = result.unwrap();
+        assert!(authenticated);
+        // shared_key_hash must be non-zero — a zeroed key would mean something went wrong
+        assert_ne!(shared_key_hash, [0u8; 32]);
+    }
+
+    /// Wrong pre-shared key must be rejected even if the ECDH handshake succeeds.
+    #[tokio::test]
+    async fn test_wrong_key_auth_failure() {
+        let (mut server, client, peer_addr) = setup_tcp_pair().await;
+        let (key, trusted) = make_shared_state(TEST_KEY, vec![peer_addr]);
+
+        // Client sends a different key than the server expects
+        let wrong_key = [0xFFu8; 32];
+        let client_task = tokio::spawn(run_client(client, wrong_key));
+
+        let result = auth_incoming(key, trusted, (&mut server, peer_addr)).await;
+
+        client_task.await.unwrap();
+
+        assert_eq!(result.unwrap(), (false, [0u8; 32], [0u8; 32]));
+    }
+
+    /// Each successful auth must produce a different shared key (ephemeral keys per connection).
+    #[tokio::test]
+    async fn test_shared_key_unique_per_session() {
+        let (mut server1, client1, peer_addr1) = setup_tcp_pair().await;
+        let (mut server2, client2, peer_addr2) = setup_tcp_pair().await;
+        let (key1, trusted1) = make_shared_state(TEST_KEY, vec![peer_addr1]);
+        let (key2, trusted2) = make_shared_state(TEST_KEY, vec![peer_addr2]);
+
+        let t1 = tokio::spawn(run_client(client1, TEST_KEY));
+        let t2 = tokio::spawn(run_client(client2, TEST_KEY));
+
+        let r1 = auth_incoming(key1, trusted1, (&mut server1, peer_addr1)).await;
+        let r2 = auth_incoming(key2, trusted2, (&mut server2, peer_addr2)).await;
+
+        t1.await.unwrap();
+        t2.await.unwrap();
+
+        let (_, _, hash1) = r1.unwrap();
+        let (_, _, hash2) = r2.unwrap();
+
+        // Two separate sessions must derive different shared keys
+        assert_ne!(hash1, hash2);
+    }
 
     #[test]
     fn test_error_display_read() {
@@ -278,6 +343,14 @@ mod tests {
         assert_eq!(
             AuthErrors::FailedToDecrypt.to_string(),
             "failed to decrypt authentication key"
+        );
+    }
+
+    #[test]
+    fn test_error_display_write() {
+        assert_eq!(
+            AuthErrors::FailedToWriteToStream.to_string(),
+            "failed to write to stream"
         );
     }
 }
