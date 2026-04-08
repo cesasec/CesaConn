@@ -174,7 +174,7 @@ pub async fn auth_incoming(
         .await
         .map_err(|_| AuthErrors::FailedToReadFromStream)?;
 
-    if buf == &[0u8] {
+    if buf != &[1u8] {
         println!(
             "Client rejected our key confirmation, authentication failed for address: {}",
             incoming_connection.1
