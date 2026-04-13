@@ -1,7 +1,7 @@
 # CesaConn
 
 <div align="center">
-  <img src="./logo.webp" alt="CesaConn Logo" width="200"/>
+  <img src="./image2.webp" alt="CesaConn Logo" width="200"/>
   
   ### Ready. Set. Connect.
   
