@@ -154,6 +154,8 @@ pub async fn auth_incoming(
             "Authentication failed for address: {}",
             incoming_connection.1
         );
+
+        Zeroize::zeroize(key_buf); // wipe decrypted key from memory before sending rejection
         return Ok((false, [0u8; 32]));
     }
 
@@ -799,15 +801,12 @@ mod tests {
             let payload = encrypt_tunnel(&shared_hash, &wrong_key).unwrap();
             server.write_all(&payload).await.unwrap();
 
-            // auth_outgoing drops the connection on rejection without sending anything,
-            // so read_exact will return EOF — ignore the error
+            // auth_outgoing sends encrypted 0x00 on rejection (29 bytes) — read it and ignore
             let _ = server.read_exact(&mut [0u8; 29]).await;
         });
 
         let result = auth_outgoing(key, trusted, (&mut client, peer_addr)).await;
-        // Drop client before awaiting server_task — auth_outgoing returned without sending,
-        // so the server's read_exact only unblocks when the stream is closed (EOF)
-        drop(client);
+        drop(client); // ensure stream is closed before awaiting server_task
         server_task.await.unwrap();
 
         assert_eq!(result.unwrap(), (false, [0u8; 32]));

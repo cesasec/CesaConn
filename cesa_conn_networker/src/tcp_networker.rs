@@ -266,11 +266,11 @@ mod tests {
         let recv_plaintext =
             cesa_conn_crypto::aes::decrypt(&shared_hash, &recv_buf[12..], &recv_nonce).unwrap();
 
+        // Encrypt the confirmation byte — server now expects 29 bytes (nonce + ciphertext)
         let confirmed = recv_plaintext == auth_key;
-        stream
-            .write_all(&[if confirmed { 0x01 } else { 0x00 }])
-            .await
-            .unwrap();
+        let conf_byte = [if confirmed { 0x01u8 } else { 0x00u8 }];
+        let e_conf = encrypt_tunnel(&shared_hash, &conf_byte).unwrap();
+        stream.write_all(&e_conf).await.unwrap();
 
         shared_hash
     }
