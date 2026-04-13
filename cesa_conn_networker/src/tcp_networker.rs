@@ -58,7 +58,7 @@ impl fmt::Display for TcpNetworkerErrors {
     }
 }
 
-// TODO : Auth
+//TODO: add streaming option for files
 /// Handles a single incoming TCP connection after it has been accepted.
 ///
 /// Steps:
@@ -136,33 +136,13 @@ pub async fn recv_handler(
 
     Zeroize::zeroize(data_key);
 
-    // Dispatch to the appropriate handler based on the action type byte
-    match ActionType::from_u8(init_buf[0]) {
-        Some(ActionType::Default) => {
-            println!("default");
-            // Handle default action
-        }
-        Some(ActionType::Debug) => {
-            println!(
-                "Received debug action | size: {} | offset: {} | data: {}",
-                size,
-                init_buf[0],
-                String::from_utf8_lossy(&data_buf)
-            );
-            // Handle debug action
-        }
-        Some(ActionType::ClipboardSync) => {
-            println!(
-                "Received clipboard sync action with size {}: {:?}",
-                size, init_buf[0]
-            );
-            // Handle clipboard sync action
-        }
-        None => {
-            println!("Received unknown action type: {}", init_buf[0]);
-            // Handle unknown action type
-        }
-    }
+    let action_type = ActionType::from_u8(init_buf[0]).unwrap_or(ActionType::Default);
+
+    //TODO: dispatch to the appropriate handler based on action type
+    println!("Received packet with action type {:?} and data: {:?}",
+        action_type,
+        String::from_utf8_lossy(&data_buf)
+    );
 
     Ok(())
 }
