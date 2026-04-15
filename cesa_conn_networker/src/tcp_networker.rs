@@ -121,6 +121,7 @@ impl fmt::Display for TcpNetworkerErrors {
 /// **Phase 3 — Data packet** (variable size, declared in init header)
 ///   Double-encrypted: outer layer = session key, inner layer = static data key.
 ///   Decrypt outer first (strips session encryption), then inner (strips data key).
+///   Both decryption steps are offloaded to spawn_blocking for large payload support.
 ///   The local d_key copy is zeroized immediately after use.
 pub async fn recv_handler(
     incoming_connection: (TcpStream, SocketAddr),
@@ -175,28 +176,38 @@ pub async fn recv_handler(
     // Phase 3a: Read the double-encrypted data packet.
     // Length was declared in the authenticated init header — we trust it because
     // the header passed AES-GCM verification, so the size field was not tampered with.
-    let e_t_data_buf = &mut vec![0u8; size as usize];
+    let mut e_t_data_buf = vec![0u8; size as usize];
 
     connection_mut
-        .read_exact(e_t_data_buf)
+        .read_exact(&mut e_t_data_buf)
         .await
         .map_err(|_| TcpNetworkerErrors::FailedToReadFromStream)?;
 
-    // Phase 3b: Strip the outer encryption layer using the session key.
+    // Phase 3b: Strip the outer encryption layer using the session key — offloaded to
+    // spawn_blocking so large payloads don't block the tokio runtime.
     // Result is still encrypted with d_key — forward secrecy is maintained because
     // session keys are ephemeral and not stored anywhere.
-    let e_data_buf = decrypt_tunnel(&shared_key, e_t_data_buf)
-        .map_err(|_| TcpNetworkerErrors::FailedToDecryptTunnel)?;
+    let e_data_buf = spawn_blocking(move || {
+        let e_t_t_data_buf = e_t_data_buf;
+        decrypt_tunnel(&shared_key, &e_t_t_data_buf)
+    })
+    .await
+    .map_err(|_| TcpNetworkerErrors::FailedToSpawnNewBlockingTask)?
+    .map_err(|_| TcpNetworkerErrors::FailedToDecryptTunnel)?;
 
     // Phase 3c: Strip the inner encryption layer using the static data key.
     // Clone d_key out of the RwLock into a local buffer so we can zeroize it after use.
-    let data_key = &mut d_key.read().await.clone();
+    let data_key = d_key.read().await.clone();
 
-    let data_buf = decrypt_tunnel(data_key, e_data_buf.as_ref())
-        .map_err(|_| TcpNetworkerErrors::FailedToDecryptTunnel)?;
-
-    // Wipe the local d_key copy from memory immediately — it's no longer needed.
-    data_key.zeroize();
+    let data_buf = spawn_blocking(move || {
+        let mut key = data_key;
+        let result = decrypt_tunnel(&key, e_data_buf.as_ref());
+        key.zeroize();
+        result
+    })
+    .await
+    .map_err(|_| TcpNetworkerErrors::FailedToSpawnNewBlockingTask)?
+    .map_err(|_| TcpNetworkerErrors::FailedToDecryptTunnel)?;
 
     // Parse the action type byte. Unknown values default to Default instead of rejecting —
     // this keeps the protocol forward-compatible with new ActionType variants added later.
@@ -369,12 +380,10 @@ pub async fn connect_handler(
     // Phase 3b: Wrap with the session key (outer layer) — also in spawn_blocking.
     // Forward secrecy: even if d_key is later leaked, past sessions remain protected
     // because shared_key is ephemeral and was never stored.
-    let e_t_data = spawn_blocking(move || {
-        encrypt_tunnel(&shared_key, &e_data)
-    })
-    .await
-    .map_err(|_| TcpNetworkerErrors::FailedToSpawnNewBlockingTask)?
-    .map_err(|_| TcpNetworkerErrors::FailedToEncryptTunnel)?;
+    let e_t_data = spawn_blocking(move || encrypt_tunnel(&shared_key, &e_data))
+        .await
+        .map_err(|_| TcpNetworkerErrors::FailedToSpawnNewBlockingTask)?
+        .map_err(|_| TcpNetworkerErrors::FailedToEncryptTunnel)?;
 
     // Phase 4: Build and send the init header now that we know the exact encrypted size.
     // size = e_t_data.len() so the receiver knows exactly how many bytes to read_exact().
