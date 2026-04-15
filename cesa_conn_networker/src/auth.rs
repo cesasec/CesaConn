@@ -117,8 +117,8 @@ pub async fn auth_incoming(
     let shared_key_hash = hash_key(&shared_key);
 
     // Wipe private key and raw shared secret from memory immediately — they're no longer needed
-    Zeroize::zeroize(private_key);
-    Zeroize::zeroize(shared_key);
+    private_key.zeroize();
+    shared_key.zeroize();
 
     // Step 3b: Send our public key to the client so they can compute the same shared secret
     incoming_connection
@@ -127,7 +127,7 @@ pub async fn auth_incoming(
         .await
         .map_err(|_| AuthErrors::FailedToWriteToStream)?;
 
-    Zeroize::zeroize(public_key); // wipe our public key from memory — already sent, not needed anymore
+    public_key.zeroize(); // wipe our public key from memory — already sent, not needed anymore
 
     // Step 4: Read the client's encrypted pre-shared key
     // Layout: [ nonce (12 bytes) | AES-GCM ciphertext (48 bytes) ] = 60 bytes total
@@ -146,7 +146,7 @@ pub async fn auth_incoming(
         .map_err(|_| AuthErrors::FailedToDecrypt)?;
 
     // Wipe the encrypted buffer and nonce — plaintext key is now in key_buf
-    Zeroize::zeroize(e_key_buf);
+    e_key_buf.zeroize();
 
     // Step 6: Compare decrypted key against the expected pre-shared key
     if key_buf != key.read().await.as_ref() {
@@ -155,12 +155,12 @@ pub async fn auth_incoming(
             incoming_connection.1
         );
 
-        Zeroize::zeroize(key_buf); // wipe decrypted key from memory before sending rejection
+        key_buf.zeroize();
         return Ok((false, [0u8; 32]));
     }
 
     // Wipe the decrypted key now that comparison is done
-    Zeroize::zeroize(key_buf);
+    key_buf.zeroize();
 
     // Step 7: Encrypt our pre-shared key and send it back — mutual authentication,
     // client will verify we know the same key
@@ -174,7 +174,7 @@ pub async fn auth_incoming(
         .map_err(|_| AuthErrors::FailedToWriteToStream)?;
 
     // Wipe sensitive data — key material no longer needed
-    Zeroize::zeroize(send_buf);
+    send_buf.zeroize();
 
     // Step 8: Read the encrypted confirmation from the client (29 bytes)
     // Layout: [ nonce (12 bytes) | AES-GCM ciphertext (17 bytes) ] — plaintext is 1 byte (0x01 = verified)
@@ -190,7 +190,7 @@ pub async fn auth_incoming(
     let confirmation_byte = &mut decrypt_tunnel(&shared_key_hash, e_confirmation_byte)
         .map_err(|_| AuthErrors::FailedToDecrypt)?;
 
-    Zeroize::zeroize(e_confirmation_byte); // wipe encrypted confirmation byte
+    e_confirmation_byte.zeroize(); // wipe encrypted confirmation byte
 
     if confirmation_byte != &[1u8] {
         println!(
@@ -198,12 +198,12 @@ pub async fn auth_incoming(
             incoming_connection.1
         );
 
-        Zeroize::zeroize(confirmation_byte);
+        confirmation_byte.zeroize();
 
         return Ok((false, [0u8; 32]));
     }
 
-    Zeroize::zeroize(confirmation_byte); // wipe confirmation byte from memory
+    confirmation_byte.zeroize(); // wipe confirmation byte from memory
 
     println!(
         "Authentication successful for address: {}",
@@ -257,7 +257,7 @@ pub async fn auth_outgoing(
         .await
         .map_err(|_| AuthErrors::FailedToWriteToStream)?;
 
-    Zeroize::zeroize(public_key); // wipe our public key from memory — already sent, not needed anymore
+    public_key.zeroize(); // wipe our public key from memory — already sent, not needed anymore
 
     // Step 3: Read the server's ephemeral public key (always exactly 32 bytes)
     let their_pub_key = &mut [0u8; 32];
@@ -275,8 +275,8 @@ pub async fn auth_outgoing(
     let shared_key_hash = hash_key(&shared_key);
 
     // Wipe private key and raw shared secret — no longer needed
-    Zeroize::zeroize(private_key);
-    Zeroize::zeroize(shared_key);
+    private_key.zeroize();
+    shared_key.zeroize();
 
     // Step 5: Encrypt and send our pre-shared key to the server for verification
     let e_key_buf = &mut encrypt_tunnel(&shared_key_hash, key.read().await.as_ref())
@@ -288,7 +288,7 @@ pub async fn auth_outgoing(
         .await
         .map_err(|_| AuthErrors::FailedToWriteToStream)?;
 
-    Zeroize::zeroize(e_key_buf);
+    e_key_buf.zeroize();
 
     // Step 6: Read the server's encrypted pre-shared key back (60 bytes)
     // Layout: [ nonce (12 bytes) | AES-GCM ciphertext (48 bytes) ]
@@ -304,7 +304,7 @@ pub async fn auth_outgoing(
     let recv_key_buf = &mut decrypt_tunnel(&shared_key_hash, recv_e_key_buf)
         .map_err(|_| AuthErrors::FailedToDecrypt)?;
 
-    Zeroize::zeroize(recv_e_key_buf);
+    recv_e_key_buf.zeroize();
 
     let confirmation_byte = &mut [1u8];
 
@@ -318,7 +318,7 @@ pub async fn auth_outgoing(
         confirmation_byte.fill(0u8); // prepare to send rejection byte
     }
 
-    Zeroize::zeroize(recv_key_buf);
+    recv_key_buf.zeroize();
 
     // Step 9: Encrypt the confirmation byte (0x01) with the session key and send it
     // Server reads 29 bytes: [ nonce (12) | AES-GCM ciphertext (17) ]
@@ -335,8 +335,8 @@ pub async fn auth_outgoing(
     let rejected = confirmation_byte == &[0u8];
 
     // Wipe key material regardless of outcome
-    Zeroize::zeroize(e_confirmation_byte);
-    Zeroize::zeroize(confirmation_byte);
+    e_confirmation_byte.zeroize();
+    confirmation_byte.zeroize();
 
     if rejected {
         // Encrypted rejection (0x00) was sent — connection closes after return
