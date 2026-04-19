@@ -1,3 +1,6 @@
+//TODO: Change find broadcaster to loop and check if the ip isnt local machine
+
+
 use core::fmt;
 use core::net::SocketAddr;
 use std::sync::Arc;

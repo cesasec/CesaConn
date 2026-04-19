@@ -53,7 +53,7 @@ async fn main() {
 
             let a_key_clone = a_key.clone();
 
-            udp_broadcast_presence(BROADCAST_NAME.as_bytes(), 10, a_key_clone).await.unwrap();
+            udp_broadcast_presence(BROADCAST_NAME.as_bytes(), 3, a_key_clone).await.unwrap();
 
             let listener = Arc::new(RwLock::new(TcpListener::bind("0.0.0.0:3232").await.unwrap()));
             let trusted_addrs = Arc::new(RwLock::new(Vec::new()));
@@ -80,7 +80,9 @@ async fn main() {
 
             let incoming_addr = udp_find_broadcaster(10, BROADCAST_NAME.as_bytes(), a_key.clone()).await.unwrap();
             let write_g = trusted_addrs.write();
-            udp_broadcast_presence(BROADCAST_NAME.as_bytes(), 10, a_key_clone).await.unwrap();
+            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+            
+            udp_broadcast_presence(BROADCAST_NAME.as_bytes(), 3, a_key_clone).await.unwrap();
 
             write_g.await.push(incoming_addr);
 

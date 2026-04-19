@@ -42,12 +42,13 @@ CesaConn is built with a military-grade security stack:
 
 | Layer | Technology | Purpose |
 |---|---|---|
-| Key Exchange | X25519 ECDH | Secure shared secret — never transmitted |
-| Auth Encryption | AES-256-GCM | Encrypt authentication hash |
-| Data Encryption | AES-256-GCM | Encrypt transmitted data |
+| Key Exchange | X25519 ECDH | Ephemeral shared secret per session — never transmitted |
+| Session Encryption | AES-256-GCM | Outer encryption layer using ephemeral session key |
+| Data Encryption | AES-256-GCM | Inner encryption layer using pre-shared data key |
+| Auth Verification | AES-256-GCM | Mutual authentication via encrypted pre-shared key |
 | Key Derivation | Argon2 | Password → cryptographic key |
 | Salt Generation | OS Entropy (SysRng) | Cryptographically secure randomness |
-| Packet Signing | Ed25519 | Every packet signed — signatures removed after verification |
+| Packet Signing | Ed25519 | Implemented — integration in progress |
 | Memory Safety | Zeroize | Keys and secrets wiped from RAM after use |
 
 ---
@@ -57,7 +58,7 @@ CesaConn is built with a military-grade security stack:
 CesaConn uses **two completely separate passwords and keys**:
 
 ```
-Password 1 (auth)   → Argon2 → Auth Key    → used ONLY for authentication
+Password 1 (auth)   → Argon2 → Auth Key    → used ONLY for authentication & discovery
 Password 2 (data)   → Argon2 → Data Key    → used ONLY for data transfer
 ```
 
@@ -68,59 +69,123 @@ If one key is compromised — the other remains secure. Both must be broken simu
 ### Full Connection Flow
 
 ```
-════════════════════════════════════════
-  PHASE 1 — ECDH KEY EXCHANGE
-════════════════════════════════════════
+════════════════════════════════════════════════════════
+  UDP DISCOVERY — Encrypted Presence Broadcasting
+════════════════════════════════════════════════════════
+
+Device A (broadcaster)              Device B (listener)
+   │                                        │
+   │  name = "CesaConn Broadcast"           │
+   │  packet = AES256(name, auth_key)       │
+   │  broadcast → 255.255.255.255:3636 ───►│
+   │                                        │
+   │                    decrypt(packet, auth_key)
+   │                    verify name matches
+   │◄─────────── return sender IP ──────────│
+
+
+════════════════════════════════════════════════════════
+  STEP 1 — IP ALLOWLIST CHECK
+════════════════════════════════════════════════════════
 
 Device A                              Device B
    │                                     │
-   │──── ECDH Public Key ──────────────►│
-   │◄─── ECDH Public Key ───────────────│
-   │                                     │
-   │  Both independently derive          │
-   │  the same shared_secret             │
-   │  shared_secret is NEVER transmitted │
+   │  Is peer IP in trusted_addrs?       │
+   │  No  → reject immediately           │
+   │  Yes → proceed                      │
 
 
-════════════════════════════════════════
-  PHASE 2 — MUTUAL AUTHENTICATION
-════════════════════════════════════════
+════════════════════════════════════════════════════════
+  STEP 2 & 3 — ECDH SESSION KEY EXCHANGE
+════════════════════════════════════════════════════════
 
 Device A                              Device B
    │                                     │
-   │  hash_auth = hash(auth_password)    │
-   │  encrypted = AES256(hash_auth,      │
-   │              shared_secret)         │
-   │  signature = Ed25519(encrypted)     │
+   │  private_a ← random (ephemeral)     │  private_b ← random (ephemeral)
+   │  public_a = X25519(private_a)       │  public_b = X25519(private_b)
    │                                     │
-   │──── [encrypted + signature] ──────►│
-   │◄─── [encrypted + signature] ────────│
+   │──── public_a (32 bytes) ──────────►│
+   │◄─── public_b (32 bytes) ────────────│
    │                                     │
-   │  verify Ed25519 signature           │
-   │  decrypt AES256                     │
-   │  compare hash_auth                  │
+   │  shared = ECDH(private_a, public_b) │  shared = ECDH(private_b, public_a)
+   │  session_key = SHA256(shared)        │  session_key = SHA256(shared)
    │                                     │
-   │  match  → ✅ authenticated          │
-   │  no match → ❌ connection rejected  │
+   │  zeroize(private_a, shared)         │  zeroize(private_b, shared)
+   │  session_key NEVER transmitted      │
 
 
-════════════════════════════════════════
-  PHASE 3 — ENCRYPTED DATA TRANSFER
-════════════════════════════════════════
+════════════════════════════════════════════════════════
+  STEP 4 — MUTUAL AUTHENTICATION
+════════════════════════════════════════════════════════
 
 Device A                              Device B
    │                                     │
-   │  encrypted = AES256(data,           │
-   │              data_key)              │
-   │  signature = Ed25519(encrypted)     │
+   │  encrypted = AES256(auth_key,       │
+   │              session_key)           │
+   │──── encrypted (60 bytes) ─────────►│
+   │                    decrypt(encrypted, session_key)
+   │                    verify == auth_key
+   │                    mismatch → reject
+   │◄─── encrypted (60 bytes) ───────────│
+   │  verify server knows same auth_key  │
+
+
+════════════════════════════════════════════════════════
+  STEP 5 — CONFIRMATION
+════════════════════════════════════════════════════════
+
+Device A                              Device B
    │                                     │
-   │◄════ [encrypted + signature] ══════►│
+   │  0x01 = verified, 0x00 = rejected   │
+   │──── confirmation byte ────────────►│
    │                                     │
-   │  verify Ed25519 signature           │
-   │  decrypt AES256                     │
-   │  signature removed after verify     │
-   │  → clean data ✅                   │
+   │  Both parties now share session_key │
+   │  and are mutually authenticated     │
+
+
+════════════════════════════════════════════════════════
+  DATA TRANSFER — Double-Layer Encryption
+════════════════════════════════════════════════════════
+
+Device A                              Device B
+   │                                     │
+   │  inner = AES256(data, data_key)     │
+   │  outer = AES256(inner, session_key) │
+   │                                     │
+   │  init_header = AES256([action_type  │
+   │    | data_size], session_key)       │
+   │                                     │
+   │──── init_header (37 bytes) ───────►│
+   │──── outer (N bytes) ───────────────►│
+   │                    decrypt(outer, session_key) → inner
+   │                    decrypt(inner, data_key) → data ✅
 ```
+
+---
+
+### Packet Layout
+
+```
+Init Header (37 bytes, encrypted with session key):
+  [ 12-byte nonce | 1-byte action_type | 8-byte data_size_le | 16-byte GCM tag ]
+
+Data Packet (N bytes):
+  [ outer: AES256-GCM with session_key [ inner: AES256-GCM with data_key [ plaintext ] ] ]
+
+Auth Exchange (60 bytes per direction):
+  [ 12-byte nonce | 32-byte encrypted key | 16-byte GCM tag ]
+```
+
+---
+
+### Action Types
+
+| Value | Name | Description |
+|---|---|---|
+| `0x00` | `Default` | Fallback for unknown types — forward compatible |
+| `0x01` | `Debug` | Testing and diagnostics |
+| `0x02` | `ConnectNewDevice` | Add a new device to trusted_addrs — no data payload |
+| `0x03` | `ClipboardSync` | Clipboard synchronization *(planned)* |
 
 ---
 
@@ -129,27 +194,38 @@ Device A                              Device B
 | Attack | CesaConn |
 |---|---|
 | Man-in-the-middle | ❌ Blocked by mutual authentication |
-| Packet tampering | ❌ Blocked by Ed25519 signatures |
-| Replay attack | ❌ Blocked by unique nonces |
-| Eavesdropping | ❌ Blocked by AES-256-GCM |
+| Packet tampering | ❌ Blocked by AES-256-GCM integrity tags |
+| Replay attack | ❌ Blocked by unique nonces per packet |
+| Eavesdropping | ❌ Blocked by double-layer AES-256-GCM |
 | Auth key compromise | ❌ Data key still secure |
-| Data key compromise | ❌ Auth key still secure |
+| Data key compromise | ❌ Past sessions protected by ephemeral session keys |
 | Brute force password | ❌ Blocked by Argon2 KDF |
 | Key theft from RAM | ❌ Keys wiped by Zeroize |
+| Unknown device connects | ❌ Blocked by IP allowlist before any crypto |
 | Server breach | ❌ There is no server |
 
 ---
 
 ## Features
 
+### Core (Implemented)
+- [x] Mutual authentication with dual-key system
+- [x] ECDH ephemeral session key exchange (forward secrecy)
+- [x] Double-layer end-to-end encryption (session key + data key)
+- [x] Encrypted UDP device discovery
+- [x] IP allowlist trusted device enforcement
+- [x] Full offline / serverless operation
+- [x] Structured tracing (`RUST_LOG` configurable)
+
+### In Progress
+- [ ] Ed25519 packet signing integration
+- [ ] TCP streaming for large file transfers
+
 ### Planned for v1.0
 - [ ] File synchronization
 - [ ] Clipboard sync
 - [ ] Notification mirroring
-- [ ] End-to-end encryption
-- [ ] Mutual authentication with dual-key system
 - [ ] Zero Trust device authorization
-- [ ] Full offline / serverless operation
 
 ### Transport Support
 - [ ] WiFi / LAN (TCP + UDP)
@@ -180,15 +256,19 @@ CesaConnCore/
 ├── cesa_conn_crypto/        # Cryptography module
 │   ├── src/
 │   │   ├── aes.rs           # AES-256-GCM encryption/decryption
-│   │   ├── salt.rs          # Secure salt generation
-│   │   ├── pswd_manager.rs  # Argon2 key derivation
+│   │   ├── ecc.rs           # Ed25519 digital signatures
+│   │   ├── ecdh.rs          # X25519 ECDH key exchange + SHA-256 hashing
+│   │   ├── salt.rs          # Cryptographically secure salt generation
+│   │   ├── pswd_manager.rs  # Argon2 password-based key derivation
 │   │   └── lib.rs
 │   └── Cargo.toml
 │
 └── cesa_conn_networker/     # Networking module
     ├── src/
-    │   ├── udp_networker.rs  # Device discovery (UDP broadcast)
-    │   ├── tcp_networker.rs  # Data transfer (TCP)
+    │   ├── auth.rs           # 5-step mutual authentication handshake
+    │   ├── udp_networker.rs  # Encrypted device discovery (UDP broadcast)
+    │   ├── tcp_networker.rs  # Double-encrypted data transfer (TCP)
+    │   ├── cesa_conn_networker.rs  # Entry point / test runner
     │   └── lib.rs
     └── Cargo.toml
 ```
@@ -217,6 +297,22 @@ cargo test -p cesa_conn_crypto
 
 # Test networking module
 cargo test -p cesa_conn_networker
+```
+
+### Manual Integration Test
+
+```bash
+# Terminal 1 — server device
+cargo run -- servertest
+
+# Terminal 2 — client device
+cargo run -- clienttest
+```
+
+Tracing verbosity is configurable via `RUST_LOG`:
+
+```bash
+RUST_LOG=cesa_conn=trace cargo run -- servertest
 ```
 
 ---
