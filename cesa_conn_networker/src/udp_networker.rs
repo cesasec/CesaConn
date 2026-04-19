@@ -4,6 +4,7 @@ use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio::sync::RwLock;
 use tokio::time::{Duration, sleep, timeout};
+use tracing::{debug, error, info, warn};
 use zeroize::Zeroize;
 
 use crate::auth::{decrypt_tunnel, encrypt_tunnel};
@@ -77,36 +78,59 @@ pub async fn udp_broadcast_presence(
         duration
     };
 
+    debug!(requested_duration = duration, capped_duration = duration, "udp_broadcast_presence started");
+
     // Bind to all interfaces on port 6363
     let socket = UdpSocket::bind("0.0.0.0:6363")
         .await
-        .map_err(|_| UdpNetworkerErrors::FailedToBindSocket)?;
+        .map_err(|e| {
+            error!(error = %e, addr = "0.0.0.0:6363", "failed to bind UDP socket for broadcast");
+            UdpNetworkerErrors::FailedToBindSocket
+        })?;
+
+    debug!(local_addr = "0.0.0.0:6363", "UDP broadcast socket bound");
 
     // Enable broadcast mode — required to send packets to 255.255.255.255
     socket
         .set_broadcast(true)
-        .map_err(|_| UdpNetworkerErrors::FailedToSetBroadcastMode)?;
+        .map_err(|e| {
+            error!(error = %e, "failed to enable broadcast mode on UDP socket");
+            UdpNetworkerErrors::FailedToSetBroadcastMode
+        })?;
 
-    println!("Successfully enabled broadcast mode");
+    info!("UDP broadcast mode enabled, will send {} packets to 255.255.255.255:3636", duration);
 
-    for _tick in 0..duration {
+    for tick in 0..duration {
         let auth_key = &mut a_key.read().await.clone();
 
         let e_msg = encrypt_tunnel(&auth_key, message)
-            .map_err(|_| UdpNetworkerErrors::FailedToEncryptTunnel)?;
+            .map_err(|e| {
+                error!(error = %e, tick, "failed to encrypt broadcast message");
+                UdpNetworkerErrors::FailedToEncryptTunnel
+            })?;
         auth_key.zeroize();
 
         // Send presence packet to the entire local network
         let bytes_sent = socket
             .send_to(e_msg.as_ref(), "255.255.255.255:3636")
             .await
-            .map_err(|_| UdpNetworkerErrors::FailedToSendBroadcast)?;
+            .map_err(|e| {
+                error!(error = %e, tick, dest = "255.255.255.255:3636", "failed to send UDP broadcast packet");
+                UdpNetworkerErrors::FailedToSendBroadcast
+            })?;
 
-        println!(
-            "Successfully broadcasted: {} bytes | Data: {}",
+        let message_str = String::from_utf8(message.to_vec())
+            .map_err(|e| {
+                error!(error = %e, "failed to convert broadcast message bytes to UTF-8 string for logging");
+                UdpNetworkerErrors::FailedToConvertU8ToString
+            })?;
+
+        debug!(
+            tick,
             bytes_sent,
-            String::from_utf8(message.to_vec())
-                .map_err(|_| UdpNetworkerErrors::FailedToConvertU8ToString)?
+            dest = "255.255.255.255:3636",
+            message = %message_str,
+            "broadcast packet sent"
         );
 
         // Wait one second before sending the next broadcast
@@ -116,9 +140,12 @@ pub async fn udp_broadcast_presence(
     // Disable broadcast mode after finishing — good practice to clean up
     socket
         .set_broadcast(false)
-        .map_err(|_| UdpNetworkerErrors::FailedToSetBroadcastMode)?;
+        .map_err(|e| {
+            error!(error = %e, "failed to disable broadcast mode on UDP socket");
+            UdpNetworkerErrors::FailedToSetBroadcastMode
+        })?;
 
-    println!("Successfully disabled broadcast mode.");
+    info!("UDP broadcast mode disabled, broadcast complete ({} packets sent)", duration);
 
     Ok(())
 }
@@ -138,44 +165,63 @@ pub async fn udp_find_broadcaster(
         duration
     };
 
+    debug!(timeout_secs = duration, "udp_find_broadcaster started, waiting for broadcast packets");
+
     // Bind to all interfaces on port 6363 — same port as broadcaster
     let socket = UdpSocket::bind("0.0.0.0:3636")
         .await
-        .map_err(|_| UdpNetworkerErrors::FailedToBindSocket)?;
+        .map_err(|e| {
+            error!(error = %e, addr = "0.0.0.0:3636", "failed to bind UDP socket for discovery");
+            UdpNetworkerErrors::FailedToBindSocket
+        })?;
+
+    debug!(local_addr = "0.0.0.0:3636", "UDP discovery socket bound");
 
     // Receive buffer — max 1024 bytes per packet
     let mut buf = [0; 1024];
 
-    println!("Searching for devices on network...");
+    info!(timeout_secs = duration, "searching for CesaConn devices on network...");
 
     // Wait for incoming packet — abort if duration expires
     let recv_result = timeout(Duration::from_secs(duration), socket.recv_from(&mut buf))
         .await
-        .map_err(|_| UdpNetworkerErrors::Timeout)?; // timeout expired;
+        .map_err(|_| {
+            warn!(timeout_secs = duration, "UDP discovery timed out — no device responded");
+            UdpNetworkerErrors::Timeout
+        })?; // timeout expired;
 
     let (len, addr) = match recv_result {
         Ok(v) => v,
         Err(e) => {
             #[cfg(windows)]
             if e.raw_os_error() == Some(10040) {
+                error!(error = %e, "received UDP packet larger than receive buffer (Windows error 10040)");
                 return Err(UdpNetworkerErrors::DataTooBig);
             }
 
+            error!(error = %e, "failed to receive UDP packet");
             return Err(UdpNetworkerErrors::FailedToFetchResult);
         }
     };
 
+    debug!(%addr, bytes_received = len, "received UDP packet");
+
     // If len equals buffer size, packet may have been truncated — discard it
     // recv_from never returns more than buf.len(), so == means truncation occurred
     if len == buf.len() {
+        warn!(%addr, bytes_received = len, buffer_size = buf.len(), "received packet fills entire buffer — likely truncated, discarding");
         buf.zeroize();
         return Err(UdpNetworkerErrors::DataTooBig);
     }
 
     // Convert received bytes to string for device name comparison
     let auth_key = &mut a_key.read().await.clone();
+    debug!(%addr, "decrypting received UDP packet");
     let name = decrypt_tunnel(auth_key, &buf[..len])
-        .map_err(|_| UdpNetworkerErrors::FailedToDecryptTunnel)?;
+        .map_err(|e| {
+            warn!(%addr, error = %e, "failed to decrypt received UDP packet — wrong key or tampered data");
+            UdpNetworkerErrors::FailedToDecryptTunnel
+        })?;
 
     buf.zeroize();
 
@@ -183,13 +229,11 @@ pub async fn udp_find_broadcaster(
 
     // Verify the packet comes from a recognized CesaConn device
     if *name == *message {
-        println!(
-            "Found device: {} at IP: {}",
-            String::from_utf8_lossy(name.as_ref()),
-            addr.ip()
-        );
+        let device_name = String::from_utf8_lossy(name.as_ref()).into_owned();
+        info!(%addr, device_name = %device_name, "found CesaConn device");
         Ok(addr)
     } else {
+        warn!(%addr, expected = %String::from_utf8_lossy(message), received = %String::from_utf8_lossy(&name), "device responded but name does not match expected value, ignoring");
         // Device responded but name doesn't match — ignore it
         Err(UdpNetworkerErrors::UnknownDevice)
     }

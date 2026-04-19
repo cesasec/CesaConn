@@ -1,6 +1,7 @@
 use core::fmt;
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey, Verifier};
 use rand::{TryRng, rngs::SysRng};
+use tracing::{error, trace};
 
 /// Errors that can occur during ECC operations
 #[derive(Debug)]
@@ -22,13 +23,18 @@ impl fmt::Display for ECCErrors {
 
 /// Generates a cryptographically secure Ed25519 signing key using OS entropy
 pub fn generate_signing_key() -> Result<[u8; 32], ECCErrors> {
+    trace!("generating Ed25519 signing key from OS entropy");
     let mut signing_key_bytes = [0u8; 32];
     let mut rng = SysRng::default();
 
     rng.try_fill_bytes(&mut signing_key_bytes)
-        .map_err(|_| ECCErrors::FailedToGenerateSigningKey)?;
+        .map_err(|e| {
+            error!(error = %e, "OS failed to provide random bytes for Ed25519 signing key generation");
+            ECCErrors::FailedToGenerateSigningKey
+        })?;
 
     let signing_key = SigningKey::from(signing_key_bytes);
+    trace!("Ed25519 signing key generated successfully");
     Ok(signing_key.to_bytes())
 }
 
@@ -43,21 +49,28 @@ pub fn calculate_verifying_key(signing_key: &[u8; 32]) -> [u8; 32] {
 /// Signs data using Ed25519 — returns a 64-byte signature
 /// Signature should be verified by the receiver before trusting the data
 pub fn sign(signing_key: &[u8; 32], data: &[u8]) -> [u8; 64] {
+    trace!(data_len = data.len(), "signing data with Ed25519");
     let signing_key = SigningKey::from_bytes(signing_key);
     let signed_data = signing_key.sign(data);
-    
+    trace!(data_len = data.len(), "Ed25519 signing complete");
     signed_data.to_bytes()
 }
 
 /// Verifies an Ed25519 signature against data and a verifying key
 /// Returns Ok(true) if valid, Ok(false) if invalid, Err if key is malformed
 pub fn verify(verifying_key: &[u8; 32], data: &[u8], signature: &[u8; 64]) -> Result<bool, ECCErrors> {
+    trace!(data_len = data.len(), "verifying Ed25519 signature");
     let verifying_key = VerifyingKey::from_bytes(verifying_key)
-        .map_err(|_| ECCErrors::FailedToVerify)?;
+        .map_err(|e| {
+            error!(error = %e, "Ed25519 verifying key bytes are malformed");
+            ECCErrors::FailedToVerify
+        })?;
 
     let signature = ed25519_dalek::Signature::from_bytes(signature);
 
-    Ok(verifying_key.verify(data, &signature).is_ok())
+    let valid = verifying_key.verify(data, &signature).is_ok();
+    trace!(data_len = data.len(), valid, "Ed25519 signature verification complete");
+    Ok(valid)
 }
 
 #[cfg(test)]

@@ -5,6 +5,7 @@ use aes_gcm::aead::{Aead, KeyInit};
 
 use rand::TryRng;
 use rand::rngs::SysRng;
+use tracing::{error, trace};
 
 /// Represents all possible errors that can occur during cryptographic operations
 #[derive(Debug)]
@@ -30,6 +31,8 @@ impl fmt::Display for AESError {
 /// Encrypts data using AES-256-GCM with a randomly generated nonce.
 /// Returns the ciphertext and the nonce — both are required for decryption.
 pub fn encrypt(key: &[u8; 32], data: &[u8]) -> Result<(Vec<u8>, [u8; 12]), AESError> {
+    trace!(data_len = data.len(), "AES-256-GCM encrypt called");
+
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
 
     // Generate a cryptographically secure random nonce using OS entropy source
@@ -38,14 +41,21 @@ pub fn encrypt(key: &[u8; 32], data: &[u8]) -> Result<(Vec<u8>, [u8; 12]), AESEr
     let mut rng = SysRng::default();
 
     rng.try_fill_bytes(&mut nonce_bytes)
-    .map_err(|_| AESError::NonceFailed)?;
+    .map_err(|e| {
+        error!(error = %e, "OS failed to generate random nonce for AES-256-GCM");
+        AESError::NonceFailed
+    })?;
 
     let nonce = Nonce::from(nonce_bytes);
 
     // AES-256-GCM provides both encryption and integrity verification (AEAD)
     let ciphertext = cipher.encrypt(&nonce, data)
-    .map_err(|_| AESError::EncryptionFailed)?;
+    .map_err(|e| {
+        error!(error = %e, data_len = data.len(), "AES-256-GCM encryption failed");
+        AESError::EncryptionFailed
+    })?;
 
+    trace!(data_len = data.len(), ciphertext_len = ciphertext.len(), "AES-256-GCM encryption successful");
     Ok((ciphertext, nonce_bytes))
 }
 
@@ -53,6 +63,8 @@ pub fn encrypt(key: &[u8; 32], data: &[u8]) -> Result<(Vec<u8>, [u8; 12]), AESEr
 /// If the data was tampered with, GCM authentication will fail automatically.
 /// Built-in integrity verification — no separate HMAC needed.
 pub fn decrypt(key: &[u8; 32], ciphertext: &[u8], nonce_bytes: &[u8; 12]) -> Result<Vec<u8>, AESError> {
+    trace!(ciphertext_len = ciphertext.len(), "AES-256-GCM decrypt called");
+
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
 
     // Dereference nonce_bytes to get owned [u8; 12] for Nonce::from
@@ -60,8 +72,12 @@ pub fn decrypt(key: &[u8; 32], ciphertext: &[u8], nonce_bytes: &[u8; 12]) -> Res
 
     // Decryption will fail if data was modified — GCM tag verification
     let plaintext = cipher.decrypt(&nonce, ciphertext)
-    .map_err(|_| AESError::DecryptionFailed)?;
+    .map_err(|e| {
+        error!(error = %e, ciphertext_len = ciphertext.len(), "AES-256-GCM decryption failed — GCM tag mismatch or wrong key");
+        AESError::DecryptionFailed
+    })?;
 
+    trace!(ciphertext_len = ciphertext.len(), plaintext_len = plaintext.len(), "AES-256-GCM decryption successful");
     Ok(plaintext)
 }
 

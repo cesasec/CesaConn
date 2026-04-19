@@ -1,6 +1,7 @@
 use core::fmt;
 use rand::TryRng;
 use rand::rngs::SysRng;
+use tracing::{debug, error};
 
 /// Errors that can occur during salt generation
 #[derive(Debug)]
@@ -25,6 +26,7 @@ impl fmt::Display for SaltError {
 /// * `Ok([u8; 32])` - Random salt ready for use with Argon2
 /// * `Err(SaltError::FailedToGenerate)` - OS failed to generate random bytes
 pub fn generate_salt() -> Result<[u8; 32], SaltError> {
+    debug!("generating 32-byte cryptographic salt from OS entropy");
     let mut salt = [0u8; 32];
 
     // SysRng uses OS cryptographic random source
@@ -32,8 +34,12 @@ pub fn generate_salt() -> Result<[u8; 32], SaltError> {
     let mut rng = SysRng::default();
 
     rng.try_fill_bytes(&mut salt)
-        .map_err(|_| SaltError::FailedToGenerate)?;
+        .map_err(|e| {
+            error!(error = %e, "OS failed to provide random bytes for salt generation");
+            SaltError::FailedToGenerate
+        })?;
 
+    debug!("32-byte salt generated successfully");
     Ok(salt)
 }
 

@@ -1,6 +1,7 @@
 use argon2::Argon2;
 
 use core::fmt;
+use tracing::{debug, error};
 
 /// Errors that can occur during password-based key derivation
 #[derive(Debug)]
@@ -28,14 +29,19 @@ impl fmt::Display for PswdMErrors {
 /// * `Ok([u8; 32])` - Derived key ready for cryptographic use
 /// * `Err(PswdMErrors::HashFailed)` - Argon2 derivation failed
 pub fn derive_key(password: &[u8], salt: [u8; 32]) -> Result<[u8; 32], PswdMErrors> {
+    debug!(password_len = password.len(), "deriving AES-256 key from password using Argon2 (intentionally slow)");
     let mut key = [0u8; 32];
 
     // Argon2 is intentionally slow — makes brute force attacks impractical
     let cipher = Argon2::default();
 
     cipher.hash_password_into(password, &salt, &mut key)
-    .map_err(|_| PswdMErrors::HashFailed)?;
+    .map_err(|e| {
+        error!(error = %e, password_len = password.len(), "Argon2 key derivation failed");
+        PswdMErrors::HashFailed
+    })?;
 
+    debug!("Argon2 key derivation successful");
     Ok(key)
 }
 

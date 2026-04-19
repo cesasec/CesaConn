@@ -3,3 +3,4 @@ members = [
     "cesa_conn_crypto",
     "cesa_conn_networker",
 ]
+resolver = "3"

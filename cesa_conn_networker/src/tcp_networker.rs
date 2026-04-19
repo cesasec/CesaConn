@@ -1,3 +1,7 @@
+//TODO: add streaming option for large files
+//TODO: add function arg to handle any further actions determined by ActionType in recv_handler
+//TODO: remove arc and rwlock for listener
+
 use core::net::SocketAddr;
 use std::fmt;
 use std::sync::Arc;
@@ -7,6 +11,7 @@ use tokio::select;
 use tokio::sync::RwLock;
 use tokio::task::spawn_blocking;
 use tokio_util::sync::CancellationToken;
+use tracing::{debug, error, info, warn};
 use zeroize::Zeroize;
 
 use crate::auth::{auth_incoming, auth_outgoing, decrypt_tunnel, encrypt_tunnel};
@@ -64,8 +69,6 @@ pub enum TcpNetworkerErrors {
     FailedToDecryptTunnel,
     /// Could not read local address from the listener — needed for logging.
     FailedToGetLocalAddr,
-    /// tokio::spawn returned a JoinError — task panicked or was cancelled.
-    FailedToSpawnNewTask,
     /// TcpStream::connect failed — target unreachable, refused, or timed out.
     FailedToConnect,
     /// AES-GCM encryption failed — should not happen under normal conditions.
@@ -86,7 +89,6 @@ impl fmt::Display for TcpNetworkerErrors {
             TcpNetworkerErrors::FailedToAuthenticate => write!(f, "authentication failed"),
             TcpNetworkerErrors::FailedToDecryptTunnel => write!(f, "failed to decrypt tunnel data"),
             TcpNetworkerErrors::FailedToGetLocalAddr => write!(f, "failed to get local address"),
-            TcpNetworkerErrors::FailedToSpawnNewTask => write!(f, "failed to spawn new task"),
             TcpNetworkerErrors::FailedToConnect => write!(f, "failed to make a connection request"),
             TcpNetworkerErrors::FailedToEncryptTunnel => write!(f, "failed to encrypt tunnel data"),
             TcpNetworkerErrors::FailedToWriteToStream => write!(f, "failed to write to stream"),
@@ -96,8 +98,6 @@ impl fmt::Display for TcpNetworkerErrors {
         }
     }
 }
-
-//TODO: add streaming option for large files
 
 /// Handles a single incoming TCP connection after it has been accepted by `recv`.
 ///
@@ -128,44 +128,53 @@ pub async fn recv_handler(
     a_key: Arc<RwLock<[u8; 32]>>,
     d_key: Arc<RwLock<[u8; 32]>>,
     trusted_addrs: Arc<RwLock<Vec<SocketAddr>>>,
-    cancellation_token: Arc<RwLock<CancellationToken>>,
+    _cancellation_token: Arc<RwLock<CancellationToken>>,
 ) -> Result<(), TcpNetworkerErrors> {
+    let peer_addr = incoming_connection.1;
+
     // Move the stream out of the tuple so we can take a mutable reference to it.
     let mut connection = incoming_connection.0;
     let connection_mut = &mut connection;
 
+    debug!(%peer_addr, "recv_handler started for incoming connection");
+
     // Phase 1: ECDH + pre-shared key handshake.
     // shared_key is ephemeral — derived fresh from ECDH for every connection.
     // All further communication on this stream uses shared_key for the outer encryption layer.
-    let (auth_result, shared_key) = auth_incoming(
-        a_key,
-        trusted_addrs,
-        (connection_mut, incoming_connection.1),
-    )
-    .await
-    .map_err(|_| TcpNetworkerErrors::FailedToAuthenticate)?;
+    debug!(%peer_addr, "phase 1: starting auth_incoming handshake");
+    let (auth_result, shared_key) =
+        auth_incoming(a_key, trusted_addrs, (connection_mut, peer_addr))
+            .await
+            .map_err(|e| {
+                error!(%peer_addr, error = %e, "auth_incoming returned an error");
+                TcpNetworkerErrors::FailedToAuthenticate
+            })?;
 
     // auth_incoming returns false (not Err) for untrusted peers — close gracefully, not as an error.
     if !auth_result {
-        println!(
-            "Authentication failed for connection from {}",
-            incoming_connection.1
-        );
+        warn!(%peer_addr, "authentication failed for incoming connection, closing gracefully");
         return Ok(());
     }
+
+    debug!(%peer_addr, "phase 1 complete: authentication successful");
 
     // Phase 2: Read and decrypt the init header.
     // Fixed size: 12 (nonce) + 9 (plaintext) + 16 (GCM tag) = 37 bytes.
     let e_init_buf = &mut [0u8; 37];
 
-    connection_mut
-        .read_exact(e_init_buf)
-        .await
-        .map_err(|_| TcpNetworkerErrors::FailedToReadFromStream)?;
+    debug!(%peer_addr, "phase 2: reading encrypted init header (37 bytes)");
+    connection_mut.read_exact(e_init_buf).await.map_err(|e| {
+        error!(%peer_addr, error = %e, "failed to read encrypted init header from stream");
+        TcpNetworkerErrors::FailedToReadFromStream
+    })?;
 
     // Decrypt using the session key — GCM tag verification catches any in-transit tampering.
+    debug!(%peer_addr, "decrypting init header with session key");
     let init_buf = decrypt_tunnel(&shared_key, e_init_buf)
-        .map_err(|_| TcpNetworkerErrors::FailedToDecryptTunnel)?;
+        .map_err(|e| {
+            error!(%peer_addr, error = %e, "failed to decrypt init header — GCM tag mismatch or wrong session key");
+            TcpNetworkerErrors::FailedToDecryptTunnel
+        })?;
 
     // Extract the encrypted data packet size from bytes [1..9] as little-endian u64.
     // This is the byte count of the encrypted packet below — not the raw plaintext size.
@@ -173,32 +182,47 @@ pub async fn recv_handler(
     size_bytes.copy_from_slice(&init_buf[1..9]);
     let size = u64::from_le_bytes(*size_bytes);
 
+    let action_type_raw = init_buf[0];
+    debug!(%peer_addr, action_type_byte = action_type_raw, data_packet_size = size, "init header decrypted successfully");
+
     // Phase 3a: Read the double-encrypted data packet.
     // Length was declared in the authenticated init header — we trust it because
     // the header passed AES-GCM verification, so the size field was not tampered with.
     let mut e_t_data_buf = vec![0u8; size as usize];
 
+    debug!(%peer_addr, size, "phase 3a: reading double-encrypted data packet");
     connection_mut
         .read_exact(&mut e_t_data_buf)
         .await
-        .map_err(|_| TcpNetworkerErrors::FailedToReadFromStream)?;
+        .map_err(|e| {
+            error!(%peer_addr, error = %e, expected_bytes = size, "failed to read double-encrypted data packet from stream");
+            TcpNetworkerErrors::FailedToReadFromStream
+        })?;
 
     // Phase 3b: Strip the outer encryption layer using the session key — offloaded to
     // spawn_blocking so large payloads don't block the tokio runtime.
     // Result is still encrypted with d_key — forward secrecy is maintained because
     // session keys are ephemeral and not stored anywhere.
+    debug!(%peer_addr, "phase 3b: stripping outer session-key encryption layer (spawn_blocking)");
     let e_data_buf = spawn_blocking(move || {
         let e_t_t_data_buf = e_t_data_buf;
         decrypt_tunnel(&shared_key, &e_t_t_data_buf)
     })
     .await
-    .map_err(|_| TcpNetworkerErrors::FailedToSpawnNewBlockingTask)?
-    .map_err(|_| TcpNetworkerErrors::FailedToDecryptTunnel)?;
+    .map_err(|e| {
+        error!(%peer_addr, error = %e, "spawn_blocking task for outer-layer decryption panicked");
+        TcpNetworkerErrors::FailedToSpawnNewBlockingTask
+    })?
+    .map_err(|e| {
+        error!(%peer_addr, error = %e, "outer-layer AES-GCM decryption failed — wrong session key or tampered data");
+        TcpNetworkerErrors::FailedToDecryptTunnel
+    })?;
 
     // Phase 3c: Strip the inner encryption layer using the static data key.
     // Clone d_key out of the RwLock into a local buffer so we can zeroize it after use.
     let data_key = d_key.read().await.clone();
 
+    debug!(%peer_addr, "phase 3c: stripping inner d_key encryption layer (spawn_blocking)");
     let data_buf = spawn_blocking(move || {
         let mut key = data_key;
         let result = decrypt_tunnel(&key, e_data_buf.as_ref());
@@ -206,18 +230,26 @@ pub async fn recv_handler(
         result
     })
     .await
-    .map_err(|_| TcpNetworkerErrors::FailedToSpawnNewBlockingTask)?
-    .map_err(|_| TcpNetworkerErrors::FailedToDecryptTunnel)?;
+    .map_err(|e| {
+        error!(%peer_addr, error = %e, "spawn_blocking task for inner-layer decryption panicked");
+        TcpNetworkerErrors::FailedToSpawnNewBlockingTask
+    })?
+    .map_err(|e| {
+        error!(%peer_addr, error = %e, "inner-layer AES-GCM decryption failed — wrong d_key or tampered data");
+        TcpNetworkerErrors::FailedToDecryptTunnel
+    })?;
 
     // Parse the action type byte. Unknown values default to Default instead of rejecting —
     // this keeps the protocol forward-compatible with new ActionType variants added later.
     let action_type = ActionType::from_u8(init_buf[0]).unwrap_or(ActionType::Default);
 
     //TODO: dispatch to the appropriate handler based on action type
-    println!(
-        "Received packet with action type {:?} and data: {:?}",
-        action_type,
-        String::from_utf8_lossy(&data_buf)
+    info!(
+        %peer_addr,
+        action_type = ?action_type,
+        data_len = data_buf.len(),
+        data = %String::from_utf8_lossy(&data_buf),
+        "received packet successfully"
     );
 
     Ok(())
@@ -239,14 +271,12 @@ pub async fn recv(
     trusted_addrs: Arc<RwLock<Vec<SocketAddr>>>,
     cancellation_token: Arc<RwLock<CancellationToken>>,
 ) -> Result<(), TcpNetworkerErrors> {
-    println!(
-        "Listening on {}",
-        listener
-            .read()
-            .await
-            .local_addr()
-            .map_err(|_| TcpNetworkerErrors::FailedToGetLocalAddr)?
-    );
+    let local_addr = listener.read().await.local_addr().map_err(|e| {
+        error!(error = %e, "failed to read local address from TCP listener");
+        TcpNetworkerErrors::FailedToGetLocalAddr
+    })?;
+
+    info!(%local_addr, "TCP listener started, waiting for incoming connections");
 
     loop {
         // Clone all Arc references before spawning — each task owns its own reference counts.
@@ -263,13 +293,19 @@ pub async fn recv(
         let guard = listener.read().await;
         let incoming_connection = select! {
             _ = cloned_token.cancelled() => {
-                println!("Quitting...");
+                info!(%local_addr, "cancellation token fired, shutting down TCP listener");
                 break;
             },
             result = guard.accept() => {
-                result.map_err(|_| TcpNetworkerErrors::FailedToAcceptConnection)?
+                result.map_err(|e| {
+                    error!(%local_addr, error = %e, "listener.accept() failed — OS-level socket error");
+                    TcpNetworkerErrors::FailedToAcceptConnection
+                })?
             }
         };
+
+        let peer_addr = incoming_connection.1;
+        info!(%local_addr, %peer_addr, "accepted incoming TCP connection, spawning recv_handler");
 
         // Spawn a dedicated task for this connection — no .await, so the loop immediately
         // circles back to accept() and can handle the next incoming connection in parallel.
@@ -278,7 +314,7 @@ pub async fn recv(
                 // If the token fires mid-handler, drop the task immediately without waiting
                 // for it to finish — prevents stale tasks from delaying shutdown.
                 _ = cloned_token.cancelled() => {
-                    println!("Quitting...");
+                    info!(%peer_addr, "cancellation token fired mid-handler, dropping recv_handler task");
                 },
                 result = recv_handler(
                     incoming_connection,
@@ -288,8 +324,8 @@ pub async fn recv(
                     cancellation_token_clone,
                 ) => {
                     match result {
-                        Ok(_) => println!("Handler finished successfully"),
-                        Err(e) => println!("Handler error: {}", e),
+                        Ok(()) => debug!(%peer_addr, "recv_handler completed successfully"),
+                        Err(e) => error!(%peer_addr, error = %e, "recv_handler returned an error"),
                     }
                 }
             }
@@ -329,7 +365,7 @@ pub async fn connect_handler(
     a_key: Arc<RwLock<[u8; 32]>>,
     d_key: Arc<RwLock<[u8; 32]>>,
     trusted_addrs: Arc<RwLock<Vec<SocketAddr>>>,
-    cancellation_token: Arc<RwLock<CancellationToken>>,
+    _cancellation_token: Arc<RwLock<CancellationToken>>,
     connect_addr: SocketAddr,
     outgoing_connection: TcpStream,
     action_type: ActionType,
@@ -337,25 +373,34 @@ pub async fn connect_handler(
 ) -> Result<(), TcpNetworkerErrors> {
     let mut connection = outgoing_connection;
 
+    debug!(%connect_addr, action_type = ?action_type, data_len = data.len(), "connect_handler started");
+
     // Phase 1: ECDH + pre-shared key handshake.
     // auth_outgoing returns false (not Err) if connect_addr is not in trusted_addrs.
+    debug!(%connect_addr, "phase 1: starting auth_outgoing handshake");
     let (auth_result, shared_key) = auth_outgoing(
         a_key,
         trusted_addrs.clone(),
         (&mut connection, connect_addr),
     )
     .await
-    .map_err(|_| TcpNetworkerErrors::FailedToAuthenticate)?;
+    .map_err(|e| {
+        error!(%connect_addr, error = %e, "auth_outgoing returned an error");
+        TcpNetworkerErrors::FailedToAuthenticate
+    })?;
 
     // Peer rejected our key, or we rejected theirs — close gracefully without sending data.
     if !auth_result {
-        println!("Authentication failed for connection from {}", connect_addr);
+        warn!(%connect_addr, "authentication failed for outgoing connection, closing gracefully");
         return Ok(());
     }
+
+    debug!(%connect_addr, "phase 1 complete: authentication successful");
 
     // Phase 2: ConnectNewDevice — register the peer as trusted and exit.
     // No data payload is defined for this action type.
     if action_type == ActionType::ConnectNewDevice {
+        info!(%connect_addr, "phase 2: ConnectNewDevice — adding peer to trusted_addrs and returning");
         let mut trusted_addrs_mod = trusted_addrs.write().await;
         trusted_addrs_mod.push(connect_addr);
         return Ok(());
@@ -366,6 +411,7 @@ pub async fn connect_handler(
     // critical for large payloads (e.g. files) so other async tasks aren't starved.
     let data_key = d_key.read().await.clone();
 
+    debug!(%connect_addr, data_len = data.len(), "phase 3a: encrypting data with d_key inner layer (spawn_blocking)");
     let e_data = spawn_blocking(move || {
         let mut key = data_key;
         let result = encrypt_tunnel(&key, &data);
@@ -374,16 +420,29 @@ pub async fn connect_handler(
         result
     })
     .await
-    .map_err(|_| TcpNetworkerErrors::FailedToSpawnNewBlockingTask)?
-    .map_err(|_| TcpNetworkerErrors::FailedToEncryptTunnel)?;
+    .map_err(|e| {
+        error!(%connect_addr, error = %e, "spawn_blocking task for inner-layer encryption panicked");
+        TcpNetworkerErrors::FailedToSpawnNewBlockingTask
+    })?
+    .map_err(|e| {
+        error!(%connect_addr, error = %e, "inner-layer AES-GCM encryption with d_key failed");
+        TcpNetworkerErrors::FailedToEncryptTunnel
+    })?;
 
     // Phase 3b: Wrap with the session key (outer layer) — also in spawn_blocking.
     // Forward secrecy: even if d_key is later leaked, past sessions remain protected
     // because shared_key is ephemeral and was never stored.
+    debug!(%connect_addr, inner_encrypted_len = e_data.len(), "phase 3b: wrapping with session key outer layer (spawn_blocking)");
     let e_t_data = spawn_blocking(move || encrypt_tunnel(&shared_key, &e_data))
         .await
-        .map_err(|_| TcpNetworkerErrors::FailedToSpawnNewBlockingTask)?
-        .map_err(|_| TcpNetworkerErrors::FailedToEncryptTunnel)?;
+        .map_err(|e| {
+            error!(%connect_addr, error = %e, "spawn_blocking task for outer-layer encryption panicked");
+            TcpNetworkerErrors::FailedToSpawnNewBlockingTask
+        })?
+        .map_err(|e| {
+            error!(%connect_addr, error = %e, "outer-layer AES-GCM encryption with session key failed");
+            TcpNetworkerErrors::FailedToEncryptTunnel
+        })?;
 
     // Phase 4: Build and send the init header now that we know the exact encrypted size.
     // size = e_t_data.len() so the receiver knows exactly how many bytes to read_exact().
@@ -392,20 +451,26 @@ pub async fn connect_handler(
     init_data[0] = action_type as u8;
     init_data[1..].copy_from_slice(&size.to_le_bytes()); // little-endian, matches recv_handler
 
-    let e_init_data = encrypt_tunnel(&shared_key, &init_data)
-        .map_err(|_| TcpNetworkerErrors::FailedToEncryptTunnel)?;
+    debug!(%connect_addr, action_type = ?action_type, data_packet_size = size, "phase 4: encrypting init header");
+    let e_init_data = encrypt_tunnel(&shared_key, &init_data).map_err(|e| {
+        error!(%connect_addr, error = %e, "failed to encrypt init header with session key");
+        TcpNetworkerErrors::FailedToEncryptTunnel
+    })?;
 
     // Send init header first, then the double-encrypted data packet.
-    connection
-        .write_all(&e_init_data)
-        .await
-        .map_err(|_| TcpNetworkerErrors::FailedToWriteToStream)?;
+    debug!(%connect_addr, "sending encrypted init header (37 bytes)");
+    connection.write_all(&e_init_data).await.map_err(|e| {
+        error!(%connect_addr, error = %e, "failed to write encrypted init header to stream");
+        TcpNetworkerErrors::FailedToWriteToStream
+    })?;
 
-    connection
-        .write_all(&e_t_data)
-        .await
-        .map_err(|_| TcpNetworkerErrors::FailedToWriteToStream)?;
+    debug!(%connect_addr, data_packet_size = size, "sending double-encrypted data packet");
+    connection.write_all(&e_t_data).await.map_err(|e| {
+        error!(%connect_addr, error = %e, "failed to write double-encrypted data packet to stream");
+        TcpNetworkerErrors::FailedToWriteToStream
+    })?;
 
+    info!(%connect_addr, action_type = ?action_type, data_packet_size = size, "connect_handler completed successfully");
     Ok(())
 }
 
@@ -433,26 +498,33 @@ pub async fn connect(
     let d_key_clone = Arc::clone(&d_key);
     let trusted_addrs_clone = Arc::clone(&trusted_addrs);
 
+    debug!(%connect_addr, action_type = ?action_type, "connect: initiating TCP connection");
+
     // Race TcpStream::connect against cancellation — if cancelled before the TCP
     // handshake completes, return immediately without touching the network.
     let outgoing_connection = select! {
         _ = cloned_token.cancelled() => {
-            println!("Quitting...");
+            info!(%connect_addr, "cancellation token fired before TCP connect, aborting");
             return Ok(());
         },
         result = TcpStream::connect(connect_addr) => {
-            result.map_err(|_| TcpNetworkerErrors::FailedToConnect)?
+            result.map_err(|e| {
+                error!(%connect_addr, error = %e, "TcpStream::connect failed — target unreachable, refused, or timed out");
+                TcpNetworkerErrors::FailedToConnect
+            })?
         }
     };
+
+    info!(%connect_addr, "TCP connection established, spawning connect_handler");
 
     // Spawn the handler — no .await so connect() returns immediately after the TCP connect.
     tokio::spawn(async move {
         select! {
             // Drop the handler immediately if the token fires mid-connection.
             _ = cloned_token.cancelled() => {
-                println!("Quitting...");
+                info!(%connect_addr, "cancellation token fired mid-handler, dropping connect_handler task");
             },
-            _ = connect_handler(
+            result = connect_handler(
                 a_key_clone,
                 d_key_clone,
                 trusted_addrs_clone,
@@ -462,7 +534,10 @@ pub async fn connect(
                 action_type,
                 data,
             ) => {
-                println!("Passed connection to handler");
+                match result {
+                    Ok(()) => debug!(%connect_addr, "connect_handler completed successfully"),
+                    Err(e) => error!(%connect_addr, error = %e, "connect_handler returned an error"),
+                }
             }
         };
     });
@@ -603,7 +678,6 @@ mod tests {
             TcpNetworkerErrors::FailedToAuthenticate,
             TcpNetworkerErrors::FailedToDecryptTunnel,
             TcpNetworkerErrors::FailedToGetLocalAddr,
-            TcpNetworkerErrors::FailedToSpawnNewTask,
             TcpNetworkerErrors::FailedToConnect,
             TcpNetworkerErrors::FailedToEncryptTunnel,
             TcpNetworkerErrors::FailedToWriteToStream,
@@ -651,14 +725,6 @@ mod tests {
         assert_eq!(
             TcpNetworkerErrors::FailedToGetLocalAddr.to_string(),
             "failed to get local address"
-        );
-    }
-
-    #[test]
-    fn test_error_display_spawn_task() {
-        assert_eq!(
-            TcpNetworkerErrors::FailedToSpawnNewTask.to_string(),
-            "failed to spawn new task"
         );
     }
 

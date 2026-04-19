@@ -1,34 +1,36 @@
 use aes_gcm::aead::OsRng;
 use sha2::{Digest, Sha256};
+use tracing::trace;
 use x25519_dalek::{PublicKey, StaticSecret};
 
 /// Generates a cryptographically secure random private key using OS entropy
 pub fn generate_private_key() -> [u8; 32] {
+    trace!("generating X25519 private key from OS entropy");
     let private_key = StaticSecret::random_from_rng(OsRng);
-
     *private_key.as_bytes()
 }
 
 /// Derives the X25519 public key from a private key
 pub fn calculate_public_key(private_key: &[u8; 32]) -> [u8; 32] {
+    trace!("deriving X25519 public key from private key");
     let private_key = StaticSecret::from(*private_key);
     let public_key = PublicKey::from(&private_key);
-
     *public_key.as_bytes()
 }
 
 /// Computes ECDH shared secret from private key and the other party's public key
 /// The result should be hashed with SHA-256 before use as an AES-256 key
 pub fn calculate_shared_key(private_key: &[u8; 32], their_public: &[u8; 32]) -> [u8; 32] {
+    trace!("computing X25519 ECDH shared secret");
     let private_key = StaticSecret::from(*private_key);
     let their_public = PublicKey::from(*their_public);
-
     *private_key.diffie_hellman(&their_public).as_bytes()
 }
 
 /// Hashes the ECDH shared secret using SHA-256 to produce a secure AES-256 key.
 /// Raw shared secret should never be used directly as an AES key — always hash first.
 pub fn hash_key(shared_key: &[u8; 32]) -> [u8; 32] {
+    trace!("hashing ECDH shared secret with SHA-256");
     Sha256::digest(*shared_key).into()
 }
 
