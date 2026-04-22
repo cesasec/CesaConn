@@ -8,7 +8,7 @@
   *CesaConn — connecting all your devices together securely.*
 
   ![Status](https://img.shields.io/badge/status-in%20development-yellow)
-  ![License](https://img.shields.io/badge/license-LGPL%203.0-blue)
+  ![License](https://img.shields.io/badge/license-AGPL%203.0-blue)
   ![Language](https://img.shields.io/badge/language-Rust-orange)
   ![Coming](https://img.shields.io/badge/coming-2026%2F2027-gold)
 </div>
@@ -331,9 +331,9 @@ CesaConn is designed with privacy as a core principle, not an afterthought:
 
 ## License
 
-CesaConn is licensed under [LGPL 3.0](LICENSE).
+CesaConn is licensed under [AGPL 3.0](LICENSE).
 
-This means you can use this library in your own projects, including proprietary ones, as long as any modifications to CesaConn itself are kept open source.
+This means any modified version of CesaConn must also be released under AGPL 3.0, including when run over a network.
 
 CesaConn application — Proprietary (CesaSec)
 
