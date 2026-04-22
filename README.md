@@ -252,7 +252,7 @@ CesaConn is built on the belief that software should serve the user — not the 
 ## Repository Structure
 
 ```
-CesaConnCore/
+CesaConn/
 ├── cesa_conn_crypto/        # Cryptography module
 │   ├── src/
 │   │   ├── aes.rs           # AES-256-GCM encryption/decryption
@@ -284,8 +284,8 @@ CesaConnCore/
 ### Build
 
 ```bash
-git clone https://github.com/czarekkdev/CesaConnCore
-cd CesaConnCore
+git clone https://github.com/cesasec/cesaconn
+cd CesaConn
 cargo build --release
 ```
 
@@ -325,15 +325,15 @@ CesaConn is designed with privacy as a core principle, not an afterthought:
 - **No telemetry** — we don't collect usage data
 - **No analytics** — we don't track you
 - **No servers** — there is nothing to breach
-- **Open source core** — verify our claims yourself
+- **Open source** — verify our claims yourself
 
 ---
 
 ## License
 
-CesaConnCore is licensed under [LGPL 3.0](LICENSE).
+CesaConn is licensed under [LGPL 3.0](LICENSE).
 
-This means you can use this library in your own projects, including proprietary ones, as long as any modifications to CesaConnCore itself are kept open source.
+This means you can use this library in your own projects, including proprietary ones, as long as any modifications to CesaConn itself are kept open source.
 
 CesaConn application — Proprietary (CesaSec)
 
