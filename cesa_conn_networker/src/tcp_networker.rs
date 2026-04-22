@@ -1,6 +1,6 @@
 //TODO: add streaming option for large files
 //TODO: add function arg to handle any further actions determined by ActionType in recv_handler
-//TODO: remove arc and rwlock for listener
+//TODO: remove arc and rwlock for listener and CancellationToken
 
 use core::net::SocketAddr;
 use std::fmt;
@@ -15,10 +15,6 @@ use tracing::{debug, error, info, warn};
 use zeroize::Zeroize;
 
 use crate::auth::{auth_incoming, auth_outgoing, decrypt_tunnel, encrypt_tunnel};
-
-// NOTE: Arc<RwLock<CancellationToken>> throughout this file could be simplified to just
-// CancellationToken (or Arc<CancellationToken>) since CancellationToken already implements
-// Clone + Send + Sync — the RwLock adds unnecessary overhead here.
 
 /// Identifies what kind of action/data is being sent in a packet.
 /// Encoded as a single byte at position [0] of the init header.
@@ -261,9 +257,6 @@ pub async fn recv_handler(
 /// Each connection runs in its own `tokio::spawn` task — `accept()` returns immediately
 /// to service the next connection without waiting for the handler to finish.
 /// The `select!` inside each spawned task drops the handler instantly if cancelled.
-///
-/// NOTE: handler errors are logged to stdout but not propagated — if you need structured
-/// error reporting, consider a channel or callback instead.
 pub async fn recv(
     listener: Arc<RwLock<TcpListener>>,
     a_key: Arc<RwLock<[u8; 32]>>,
@@ -479,9 +472,6 @@ pub async fn connect_handler(
 /// Returns immediately after the TCP connect resolves — auth and data transfer happen
 /// inside a spawned task concurrently with other work. Cancellation is checked both
 /// before the TCP connect and mid-handler inside the spawned task.
-///
-/// NOTE: errors from the spawned connect_handler are silently dropped.
-/// If error reporting is needed, consider a channel or callback.
 pub async fn connect(
     a_key: Arc<RwLock<[u8; 32]>>,
     d_key: Arc<RwLock<[u8; 32]>>,
