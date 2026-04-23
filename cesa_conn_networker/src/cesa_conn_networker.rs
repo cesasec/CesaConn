@@ -63,7 +63,7 @@ async fn main() {
 
             write_g.await.push(incoming_addr);
 
-            let cancellation_token = Arc::new(RwLock::new(CancellationToken::new()));
+            let cancellation_token = CancellationToken::new();
 
             recv(listener, a_key.clone(), a_key.clone(), trusted_addrs, cancellation_token).await.unwrap();
         }
@@ -86,7 +86,7 @@ async fn main() {
 
             write_g.await.push(incoming_addr);
 
-            let cancellation_token = Arc::new(RwLock::new(CancellationToken::new()));
+            let cancellation_token = CancellationToken::new();
 
             let message = "test message";
 

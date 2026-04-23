@@ -124,7 +124,6 @@ pub async fn recv_handler(
     a_key: Arc<RwLock<[u8; 32]>>,
     d_key: Arc<RwLock<[u8; 32]>>,
     trusted_addrs: Arc<RwLock<Vec<SocketAddr>>>,
-    _cancellation_token: Arc<RwLock<CancellationToken>>,
 ) -> Result<(), TcpNetworkerErrors> {
     let peer_addr = incoming_connection.1;
 
@@ -262,7 +261,7 @@ pub async fn recv(
     a_key: Arc<RwLock<[u8; 32]>>,
     d_key: Arc<RwLock<[u8; 32]>>,
     trusted_addrs: Arc<RwLock<Vec<SocketAddr>>>,
-    cancellation_token: Arc<RwLock<CancellationToken>>,
+    cancellation_token: CancellationToken,
 ) -> Result<(), TcpNetworkerErrors> {
     let local_addr = listener.read().await.local_addr().map_err(|e| {
         error!(error = %e, "failed to read local address from TCP listener");
@@ -274,8 +273,7 @@ pub async fn recv(
     loop {
         // Clone all Arc references before spawning — each task owns its own reference counts.
         // This avoids the spawned task borrowing from the loop's local scope.
-        let cancellation_token_clone = Arc::clone(&cancellation_token);
-        let cloned_token = cancellation_token.read().await.clone();
+        let cloned_token = cancellation_token.clone();
         let a_key_clone = Arc::clone(&a_key);
         let d_key_clone = Arc::clone(&d_key);
         let trusted_addrs_clone = Arc::clone(&trusted_addrs);
@@ -314,7 +312,6 @@ pub async fn recv(
                     a_key_clone,
                     d_key_clone,
                     trusted_addrs_clone,
-                    cancellation_token_clone,
                 ) => {
                     match result {
                         Ok(()) => debug!(%peer_addr, "recv_handler completed successfully"),
@@ -358,7 +355,6 @@ pub async fn connect_handler(
     a_key: Arc<RwLock<[u8; 32]>>,
     d_key: Arc<RwLock<[u8; 32]>>,
     trusted_addrs: Arc<RwLock<Vec<SocketAddr>>>,
-    _cancellation_token: Arc<RwLock<CancellationToken>>,
     connect_addr: SocketAddr,
     outgoing_connection: TcpStream,
     action_type: ActionType,
@@ -476,14 +472,13 @@ pub async fn connect(
     a_key: Arc<RwLock<[u8; 32]>>,
     d_key: Arc<RwLock<[u8; 32]>>,
     trusted_addrs: Arc<RwLock<Vec<SocketAddr>>>,
-    cancellation_token: Arc<RwLock<CancellationToken>>,
+    cancellation_token: CancellationToken,
     connect_addr: SocketAddr,
     action_type: ActionType,
     data: Vec<u8>,
 ) -> Result<(), TcpNetworkerErrors> {
     // Clone Arcs before the select! — the spawned task needs its own reference counts.
-    let cancellation_token_clone = Arc::clone(&cancellation_token);
-    let cloned_token = cancellation_token.read().await.clone();
+    let cloned_token = cancellation_token.clone();
     let a_key_clone = Arc::clone(&a_key);
     let d_key_clone = Arc::clone(&d_key);
     let trusted_addrs_clone = Arc::clone(&trusted_addrs);
@@ -518,7 +513,6 @@ pub async fn connect(
                 a_key_clone,
                 d_key_clone,
                 trusted_addrs_clone,
-                cancellation_token_clone,
                 connect_addr,
                 outgoing_connection,
                 action_type,
@@ -544,6 +538,7 @@ mod tests {
     };
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
+    use tokio_util::sync::CancellationToken;
 
     // Pre-shared keys used across all tests — constant for deterministic, reproducible runs.
     const TEST_A_KEY: [u8; 32] = [0xAB; 32]; // authentication key
@@ -562,13 +557,11 @@ mod tests {
         Arc<RwLock<[u8; 32]>>,
         Arc<RwLock<[u8; 32]>>,
         Arc<RwLock<Vec<SocketAddr>>>,
-        Arc<RwLock<CancellationToken>>,
     ) {
         (
             Arc::new(RwLock::new(a_key)),
             Arc::new(RwLock::new(d_key)),
             Arc::new(RwLock::new(trusted)),
-            Arc::new(RwLock::new(CancellationToken::new())),
         )
     }
 
@@ -764,11 +757,11 @@ mod tests {
         let (server, peer_addr) = listener.accept().await.unwrap();
 
         // Empty trusted list — peer_addr fails the allowlist check inside auth_incoming.
-        let (a_key, d_key, trusted, token) = make_state(TEST_A_KEY, TEST_D_KEY, vec![]);
+        let (a_key, d_key, trusted) = make_state(TEST_A_KEY, TEST_D_KEY, vec![]);
 
         drop(client); // server rejects before reading any data
 
-        let result = recv_handler((server, peer_addr), a_key, d_key, trusted, token).await;
+        let result = recv_handler((server, peer_addr), a_key, d_key, trusted).await;
         assert!(result.is_ok());
     }
 
@@ -781,11 +774,11 @@ mod tests {
         let (server, peer_addr) = listener.accept().await.unwrap();
 
         // peer_addr is trusted — auth proceeds, then fails when stream closes immediately.
-        let (a_key, d_key, trusted, token) = make_state(TEST_A_KEY, TEST_D_KEY, vec![peer_addr]);
+        let (a_key, d_key, trusted) = make_state(TEST_A_KEY, TEST_D_KEY, vec![peer_addr]);
 
         drop(client); // EOF on auth_incoming's first read_exact
 
-        let result = recv_handler((server, peer_addr), a_key, d_key, trusted, token).await;
+        let result = recv_handler((server, peer_addr), a_key, d_key, trusted).await;
         assert_eq!(
             result.unwrap_err(),
             TcpNetworkerErrors::FailedToAuthenticate
@@ -804,14 +797,13 @@ mod tests {
         let mut client = TcpStream::connect(addr).await.unwrap();
         let (server, peer_addr) = listener.accept().await.unwrap();
 
-        let (a_key, d_key, trusted, token) = make_state(TEST_A_KEY, TEST_D_KEY, vec![peer_addr]);
+        let (a_key, d_key, trusted) = make_state(TEST_A_KEY, TEST_D_KEY, vec![peer_addr]);
 
         let server_task = tokio::spawn(recv_handler(
             (server, peer_addr),
             a_key,
             d_key,
             trusted,
-            token,
         ));
 
         // auth_outgoing sends the wrong key then reads the server's response.
@@ -834,14 +826,13 @@ mod tests {
         let mut client = TcpStream::connect(addr).await.unwrap();
         let (server, peer_addr) = listener.accept().await.unwrap();
 
-        let (a_key, d_key, trusted, token) = make_state(TEST_A_KEY, TEST_D_KEY, vec![peer_addr]);
+        let (a_key, d_key, trusted) = make_state(TEST_A_KEY, TEST_D_KEY, vec![peer_addr]);
 
         let server_task = tokio::spawn(recv_handler(
             (server, peer_addr),
             a_key,
             d_key,
             trusted,
-            token,
         ));
 
         // Auth succeeds, then send 37 random bytes as the init header.
@@ -864,14 +855,13 @@ mod tests {
         let mut client = TcpStream::connect(addr).await.unwrap();
         let (server, peer_addr) = listener.accept().await.unwrap();
 
-        let (a_key, d_key, trusted, token) = make_state(TEST_A_KEY, TEST_D_KEY, vec![peer_addr]);
+        let (a_key, d_key, trusted) = make_state(TEST_A_KEY, TEST_D_KEY, vec![peer_addr]);
 
         let server_task = tokio::spawn(recv_handler(
             (server, peer_addr),
             a_key,
             d_key,
             trusted,
-            token,
         ));
 
         client_auth(&mut client, TEST_A_KEY).await;
@@ -900,14 +890,13 @@ mod tests {
         let mut client = TcpStream::connect(addr).await.unwrap();
         let (server, peer_addr) = listener.accept().await.unwrap();
 
-        let (a_key, d_key, trusted, token) = make_state(TEST_A_KEY, TEST_D_KEY, vec![peer_addr]);
+        let (a_key, d_key, trusted) = make_state(TEST_A_KEY, TEST_D_KEY, vec![peer_addr]);
 
         let server_task = tokio::spawn(recv_handler(
             (server, peer_addr),
             a_key,
             d_key,
             trusted,
-            token,
         ));
 
         // Auth: complete the handshake and obtain the ephemeral session key.
@@ -941,14 +930,13 @@ mod tests {
         let mut client = TcpStream::connect(addr).await.unwrap();
         let (server, peer_addr) = listener.accept().await.unwrap();
 
-        let (a_key, d_key, trusted, token) = make_state(TEST_A_KEY, TEST_D_KEY, vec![peer_addr]);
+        let (a_key, d_key, trusted) = make_state(TEST_A_KEY, TEST_D_KEY, vec![peer_addr]);
 
         let server_task = tokio::spawn(recv_handler(
             (server, peer_addr),
             a_key,
             d_key,
             trusted,
-            token,
         ));
 
         let shared_hash = client_auth(&mut client, TEST_A_KEY).await;
@@ -990,9 +978,9 @@ mod tests {
         let (server_stream, peer_addr) = listener.accept().await.unwrap();
 
         // Server trusts the client's ephemeral addr; client trusts the server addr.
-        let (a_key_s, d_key_s, trusted_s, token_s) =
+        let (a_key_s, d_key_s, trusted_s) =
             make_state(TEST_A_KEY, TEST_D_KEY, vec![client_addr]);
-        let (a_key_c, d_key_c, trusted_c, token_c) =
+        let (a_key_c, d_key_c, trusted_c) =
             make_state(TEST_A_KEY, TEST_D_KEY, vec![server_addr]);
 
         // Spawn the server (recv_handler) — blocks waiting for the client's ECDH public key.
@@ -1001,7 +989,6 @@ mod tests {
             a_key_s,
             d_key_s,
             trusted_s,
-            token_s,
         ));
 
         // Run the client (connect_handler) inline — drives auth + double-encrypt + send.
@@ -1009,7 +996,6 @@ mod tests {
             a_key_c,
             d_key_c,
             trusted_c,
-            token_c,
             server_addr,
             outgoing,
             ActionType::Debug,
@@ -1031,9 +1017,9 @@ mod tests {
         let client_addr = outgoing.local_addr().unwrap();
         let (server_stream, peer_addr) = listener.accept().await.unwrap();
 
-        let (a_key_s, d_key_s, trusted_s, token_s) =
+        let (a_key_s, d_key_s, trusted_s) =
             make_state(TEST_A_KEY, TEST_D_KEY, vec![client_addr]);
-        let (a_key_c, d_key_c, trusted_c, token_c) =
+        let (a_key_c, d_key_c, trusted_c) =
             make_state(TEST_A_KEY, TEST_D_KEY, vec![server_addr]);
 
         let server_task = tokio::spawn(recv_handler(
@@ -1041,14 +1027,12 @@ mod tests {
             a_key_s,
             d_key_s,
             trusted_s,
-            token_s,
         ));
 
         let result = connect_handler(
             a_key_c,
             d_key_c,
             trusted_c,
-            token_c,
             server_addr,
             outgoing,
             ActionType::ClipboardSync,
@@ -1083,7 +1067,6 @@ mod tests {
         let trusted_clone = Arc::clone(&trusted);
         let a_key = Arc::new(RwLock::new(TEST_A_KEY));
         let d_key = Arc::new(RwLock::new(TEST_D_KEY));
-        let token = Arc::new(RwLock::new(CancellationToken::new()));
 
         // Server side: recv_handler waits for data that never comes — it will get EOF
         // when connect_handler returns after auth (ConnectNewDevice shortcut).
@@ -1092,14 +1075,12 @@ mod tests {
             Arc::new(RwLock::new(TEST_A_KEY)),
             Arc::new(RwLock::new(TEST_D_KEY)),
             Arc::new(RwLock::new(vec![client_addr])),
-            Arc::new(RwLock::new(CancellationToken::new())),
         ));
 
         let result = connect_handler(
             a_key,
             d_key,
             trusted_clone,
-            token,
             server_addr,
             outgoing,
             ActionType::ConnectNewDevice,
@@ -1122,12 +1103,12 @@ mod tests {
     /// Cancelling before connect() is called must return Ok(()) immediately.
     #[tokio::test]
     async fn test_connect_cancels_before_connecting() {
-        let token = Arc::new(RwLock::new(CancellationToken::new()));
+        let token = CancellationToken::new();
         let a_key = Arc::new(RwLock::new(TEST_A_KEY));
         let d_key = Arc::new(RwLock::new(TEST_D_KEY));
         let trusted = Arc::new(RwLock::new(vec![]));
 
-        token.read().await.cancel(); // cancel before calling connect
+        token.cancel(); // cancel before calling connect
 
         let unreachable: SocketAddr = "127.0.0.1:19999".parse().unwrap();
         let result = connect(
@@ -1149,7 +1130,7 @@ mod tests {
         let a_key = Arc::new(RwLock::new(TEST_A_KEY));
         let d_key = Arc::new(RwLock::new(TEST_D_KEY));
         let trusted = Arc::new(RwLock::new(vec![]));
-        let token = Arc::new(RwLock::new(CancellationToken::new()));
+        let token = CancellationToken::new();
 
         // Bind then drop immediately — port is closed by the time TcpStream::connect runs.
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
