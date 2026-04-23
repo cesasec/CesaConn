@@ -1,0 +1,20 @@
+[package]
+name = "cesa_conn_tui"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "cesa_conn_tui"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cesa_conn_tui"
+path = "src/main.rs"
+
+[dependencies]
+ratatui = "0.29"
+crossterm = "0.28"
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+dirs = "5"
+cesa_conn_ipc = { path = "../cesa_conn_ipc" }
