@@ -13,7 +13,7 @@ use zeroize::Zeroize;
 use crate::auth::{decrypt_tunnel, encrypt_tunnel};
 
 /// Errors that can occur during UDP networking operations
-#[derive(Debug, PartialEq)] // Dodaj tę linię!
+#[derive(Debug, PartialEq)]
 pub enum UdpNetworkerErrors {
     /// Failed to bind UDP socket to the given address
     FailedToBindSocket,

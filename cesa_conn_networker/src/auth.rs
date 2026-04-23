@@ -775,17 +775,6 @@ mod tests {
     // auth_outgoing tests
     // -------------------------------------------------------------------------
 
-    /// Simulates the full server side of the handshake (mirrors run_client).
-    /// Returns true if the client's confirmation byte was 0x01.
-    async fn _run_server(mut stream: TcpStream, auth_key: [u8; 32], peer_addr: SocketAddr) -> bool {
-        let trusted = Arc::new(RwLock::new(vec![peer_addr]));
-        let key = Arc::new(RwLock::new(auth_key));
-        match auth_incoming(key, trusted, (&mut stream, peer_addr)).await {
-            Ok((result, _)) => result,
-            Err(_) => false,
-        }
-    }
-
     /// Connecting to an address not in the trusted list must be rejected immediately.
     #[tokio::test]
     async fn test_outgoing_untrusted_addr_rejected() {

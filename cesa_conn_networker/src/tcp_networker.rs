@@ -257,13 +257,13 @@ pub async fn recv_handler(
 /// to service the next connection without waiting for the handler to finish.
 /// The `select!` inside each spawned task drops the handler instantly if cancelled.
 pub async fn recv(
-    listener: Arc<RwLock<TcpListener>>,
+    listener: &TcpListener,
     a_key: Arc<RwLock<[u8; 32]>>,
     d_key: Arc<RwLock<[u8; 32]>>,
     trusted_addrs: Arc<RwLock<Vec<SocketAddr>>>,
     cancellation_token: CancellationToken,
 ) -> Result<(), TcpNetworkerErrors> {
-    let local_addr = listener.read().await.local_addr().map_err(|e| {
+    let local_addr = listener.local_addr().map_err(|e| {
         error!(error = %e, "failed to read local address from TCP listener");
         TcpNetworkerErrors::FailedToGetLocalAddr
     })?;
@@ -278,16 +278,13 @@ pub async fn recv(
         let d_key_clone = Arc::clone(&d_key);
         let trusted_addrs_clone = Arc::clone(&trusted_addrs);
 
-        // Hold a read guard on the listener while waiting for accept().
         // select! races accept() against the cancellation signal — whichever fires first wins.
-        // The guard is released when the select! arm resolves.
-        let guard = listener.read().await;
         let incoming_connection = select! {
             _ = cloned_token.cancelled() => {
                 info!(%local_addr, "cancellation token fired, shutting down TCP listener");
                 break;
             },
-            result = guard.accept() => {
+            result = listener.accept() => {
                 result.map_err(|e| {
                     error!(%local_addr, error = %e, "listener.accept() failed — OS-level socket error");
                     TcpNetworkerErrors::FailedToAcceptConnection
@@ -532,7 +529,7 @@ pub async fn connect(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::encrypt_tunnel;
+    use crate::auth::{decrypt_tunnel, encrypt_tunnel};
     use cesa_conn_crypto::ecdh::{
         calculate_public_key, calculate_shared_key, generate_private_key, hash_key,
     };
@@ -589,9 +586,7 @@ mod tests {
         // Step 4: read server's key echo (60 bytes) and verify it matches our auth key.
         let recv_buf = &mut [0u8; 60];
         stream.read_exact(recv_buf).await.unwrap();
-        let recv_nonce: [u8; 12] = recv_buf[0..12].try_into().unwrap();
-        let recv_plaintext =
-            cesa_conn_crypto::aes::decrypt(&shared_hash, &recv_buf[12..], &recv_nonce).unwrap();
+        let recv_plaintext = decrypt_tunnel(&shared_hash, recv_buf).unwrap();
 
         // Step 5: send confirmation byte — 0x01 confirmed, 0x00 rejected (29 bytes).
         let confirmed = recv_plaintext == auth_key;
@@ -759,7 +754,7 @@ mod tests {
         // Empty trusted list — peer_addr fails the allowlist check inside auth_incoming.
         let (a_key, d_key, trusted) = make_state(TEST_A_KEY, TEST_D_KEY, vec![]);
 
-        drop(client); // server rejects before reading any data
+        drop(client); // cleanup — server returns Ok without reading anything (IP not in trusted_addrs)
 
         let result = recv_handler((server, peer_addr), a_key, d_key, trusted).await;
         assert!(result.is_ok());

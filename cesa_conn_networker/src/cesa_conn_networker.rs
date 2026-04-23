@@ -55,7 +55,7 @@ async fn main() {
 
             udp_broadcast_presence(BROADCAST_NAME.as_bytes(), 3, a_key_clone).await.unwrap();
 
-            let listener = Arc::new(RwLock::new(TcpListener::bind("0.0.0.0:3232").await.unwrap()));
+            let listener = TcpListener::bind("0.0.0.0:3232").await.unwrap();
             let trusted_addrs = Arc::new(RwLock::new(Vec::new()));
 
             let incoming_addr = udp_find_broadcaster(10, BROADCAST_NAME.as_bytes(), a_key.clone()).await.unwrap();
@@ -65,7 +65,7 @@ async fn main() {
 
             let cancellation_token = CancellationToken::new();
 
-            recv(listener, a_key.clone(), a_key.clone(), trusted_addrs, cancellation_token).await.unwrap();
+            recv(&listener, a_key.clone(), a_key.clone(), trusted_addrs, cancellation_token).await.unwrap();
         }
 
         "clienttest" => {
