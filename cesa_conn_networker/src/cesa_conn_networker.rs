@@ -1,8 +1,5 @@
-/* TODO NOW: 
-IMPORTANT:
+/* TODO NOW:
 
-TCP CONNECTIVITY
-AUTH
 
 ---------------
 
@@ -10,7 +7,6 @@ CLIPBOARD SYNC
 FOLDER SYNC
 
 */
-
 
 /* TODO AFTER POC:
 
@@ -22,82 +18,203 @@ GET RID OF STORING KEYS IN RAM
 
  */
 
-
-
-mod udp_networker;
-mod tcp_networker;
 mod auth;
+mod tcp_networker;
+mod udp_networker;
 use std::{env, net::SocketAddr, sync::Arc};
+use tracing::{error, warn};
 use tracing_subscriber::EnvFilter;
 
-use cesa_conn_crypto::{pswd_manager::derive_key};
-use tokio::{net::{TcpListener}, sync::RwLock};
+use cesa_conn_crypto::pswd_manager::derive_key;
+use tokio::{net::TcpListener, select, sync::RwLock};
 use tokio_util::sync::CancellationToken;
 
-use crate::{tcp_networker::{ActionType, connect, recv}, udp_networker::{BROADCAST_NAME, udp_broadcast_presence, udp_find_broadcaster}};
+use crate::{
+    tcp_networker::{ActionType, connect, recv},
+    udp_networker::{
+        BROADCAST_NAME, UdpNetworkerErrors, udp_broadcast_presence, udp_find_broadcaster,
+    },
+};
 
 #[tokio::main]
 async fn main() {
+    // debug in dev builds, info in release — RUST_LOG overrides both at runtime
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive("cesa_conn=debug".parse().unwrap()))
+        .with_env_filter(
+            EnvFilter::from_default_env().add_directive(
+                if cfg!(debug_assertions) {
+                    "cesa_conn=debug"
+                } else {
+                    "cesa_conn=info"
+                }
+                .parse()
+                .unwrap(),
+            ),
+        )
         .init();
 
+    // args[0] = binary path, args[1] = subcommand, args[2..] = subcommand-specific params
     let args: Vec<String> = env::args().collect();
 
-    match args[1].as_str() {
-        "servertest" => {
-            let test_psw = "password".as_bytes();
-            let mut salt = [0u8; 32];
-            salt[0..test_psw.len()].copy_from_slice(test_psw);
-            let a_key = Arc::new(RwLock::new(derive_key(test_psw, salt).unwrap()));
+    let bin = &args[0];
 
-            let a_key_clone = a_key.clone();
+    if args.len() > 1 {
+        match args[1].as_str() {
+            // servertest <password>
+            // Starts a TCP listener and discovers clients via UDP.
+            // Uses the same key for both auth and data encryption — test only.
+            "servertest" => {
+                if args.len() < 3 {
+                    error!("Missing argument.\nUsage: {bin} servertest <password>");
+                    return;
+                }
 
-            udp_broadcast_presence(BROADCAST_NAME.as_bytes(), 3, a_key_clone).await.unwrap();
+                let test_psw = args[2].as_bytes();
+                // Salt derived from the password itself — acceptable for testing only
+                let mut salt = [0u8; 32];
+                salt[0..test_psw.len()].copy_from_slice(test_psw);
+                let a_key = Arc::new(RwLock::new(derive_key(test_psw, salt).unwrap()));
 
-            let listener = TcpListener::bind("0.0.0.0:3232").await.unwrap();
-            let trusted_addrs = Arc::new(RwLock::new(Vec::new()));
+                let listener = TcpListener::bind("0.0.0.0:3232").await.unwrap();
+                let trusted_addrs = Arc::new(RwLock::new(Vec::new()));
+                let cancellation_token = CancellationToken::new();
 
-            let incoming_addr = udp_find_broadcaster(10, BROADCAST_NAME.as_bytes(), a_key.clone()).await.unwrap();
-            let write_g = trusted_addrs.write();
+                let cancellation_token_clone = cancellation_token.clone();
+                let trusted_addrs_clone = trusted_addrs.clone();
+                let a_key_clone = a_key.clone();
 
-            write_g.await.push(incoming_addr);
+                // Background task: UDP peer discovery loop.
+                // Alternates between broadcasting presence and listening for responses
+                // so both sides can find each other regardless of who starts first.
+                tokio::spawn(async move {
+                    loop {
+                        // Inner loop retries until a valid peer is found, skipping timeouts
+                        // and wrong-key peers without propagating those as fatal errors.
+                        let incoming_addr = loop {
+                            udp_broadcast_presence(
+                                BROADCAST_NAME.as_bytes(),
+                                1,
+                                a_key_clone.clone(),
+                            )
+                            .await
+                            .unwrap();
+                            break match udp_find_broadcaster(
+                                3,
+                                BROADCAST_NAME.as_bytes(),
+                                a_key_clone.clone(),
+                            )
+                            .await
+                            {
+                                Ok(addr) => Ok(addr),
+                                Err(e) if e == UdpNetworkerErrors::Timeout => continue,
+                                Err(e) if e == UdpNetworkerErrors::FailedToDecryptTunnel => {
+                                    warn!("Someone tired to connect with wrong key");
+                                    continue;
+                                }
+                                Err(e) => Err(e),
+                            }
+                            .unwrap();
+                        };
+                        // TODO: incoming_addr is pushed twice — once unconditionally here,
+                        // and once more in the select block below. One of these should be removed.
+                        trusted_addrs_clone.write().await.push(incoming_addr);
 
-            let cancellation_token = CancellationToken::new();
+                        // Check for cancellation before looping back to discover the next peer.
+                        select! {
+                            _ = cancellation_token_clone.cancelled() => break,
+                        }
+                    }
+                });
 
-            recv(&listener, a_key.clone(), a_key.clone(), trusted_addrs, cancellation_token).await.unwrap();
+                recv(
+                    &listener,
+                    a_key.clone(),
+                    a_key.clone(),
+                    trusted_addrs,
+                    cancellation_token.clone(),
+                )
+                .await
+                .unwrap();
+            }
+
+            // clienttest <message> <password>
+            // Discovers a servertest peer via UDP, then sends <message> over TCP.
+            "clienttest" => {
+                if args.len() < 4 {
+                    error!("Missing argument.\nUsage: {bin} clienttest <message> <password>");
+                    return;
+                }
+
+                let test_psw = args[3].as_bytes();
+                let mut salt = [0u8; 32];
+                salt[0..test_psw.len()].copy_from_slice(test_psw);
+                let a_key = Arc::new(RwLock::new(derive_key(test_psw, salt).unwrap()));
+
+                let a_key_clone = a_key.clone();
+
+                let trusted_addrs = Arc::new(RwLock::new(Vec::new()));
+
+                // UDP discovery: listen for a broadcaster first, then announce ourselves
+                // so the server adds us to its trusted list before we attempt TCP.
+                let incoming_addr = loop {
+                    let incoming_addr =
+                        match udp_find_broadcaster(1, BROADCAST_NAME.as_bytes(), a_key.clone())
+                            .await
+                        {
+                            Ok(addr) => Ok(addr),
+                            Err(e) if e == UdpNetworkerErrors::Timeout => continue,
+                            Err(e) if e == UdpNetworkerErrors::FailedToDecryptTunnel => {
+                                warn!("Someone tired to connect with wrong key");
+                                continue;
+                            }
+                            Err(e) => Err(e),
+                        }
+                        .unwrap();
+
+                    udp_broadcast_presence(BROADCAST_NAME.as_bytes(), 3, a_key_clone)
+                        .await
+                        .unwrap();
+
+                    break incoming_addr;
+                };
+
+                // Wait 2 seconds before adding to trusted_addrs — gives the server time to process
+                // our UDP broadcast and add us to its own trusted list before we attempt TCP.
+                // The lock is not held during the sleep; write() is only polled on the .await line.
+                let write_g = trusted_addrs.write();
+                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+
+                write_g.await.push(incoming_addr);
+
+                let cancellation_token = CancellationToken::new();
+
+                let message = args[2].as_str();
+
+                // Server always listens on port 3232 — only the IP comes from UDP discovery
+                let connect_addr = SocketAddr::new(incoming_addr.ip(), 3232);
+
+                let action_type = ActionType::Debug;
+
+                connect(
+                    a_key.clone(),
+                    a_key.clone(),
+                    trusted_addrs,
+                    cancellation_token,
+                    connect_addr,
+                    action_type,
+                    message.as_bytes().to_vec(),
+                )
+                .await
+                .unwrap();
+
+                // Keep the process alive long enough for the spawned connect_handler task to finish
+                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+            }
+            unknown => {
+                error!("Unknown subcommand: '{unknown}'.\nUsage:\n  {bin} servertest <password>\n  {bin} clienttest <message> <password>");
+            }
         }
-
-        "clienttest" => {
-            let test_psw = "password".as_bytes();
-            let mut salt = [0u8; 32];
-            salt[0..test_psw.len()].copy_from_slice(test_psw);
-            let a_key = Arc::new(RwLock::new(derive_key(test_psw, salt).unwrap()));
-
-            let a_key_clone = a_key.clone();
-
-            let trusted_addrs = Arc::new(RwLock::new(Vec::new()));
-
-            let incoming_addr = udp_find_broadcaster(10, BROADCAST_NAME.as_bytes(), a_key.clone()).await.unwrap();
-            let write_g = trusted_addrs.write();
-            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-            
-            udp_broadcast_presence(BROADCAST_NAME.as_bytes(), 3, a_key_clone).await.unwrap();
-
-            write_g.await.push(incoming_addr);
-
-            let cancellation_token = CancellationToken::new();
-
-            let message = "test message";
-
-            let connect_addr = SocketAddr::new(incoming_addr.ip(), 3232);
-
-            let action_type = ActionType::Debug;
-
-            connect(a_key.clone(), a_key.clone(), trusted_addrs, cancellation_token, connect_addr, action_type, message.as_bytes().to_vec()).await.unwrap();
-
-            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-        }
-        _ => {}
+    } else {
+        error!("No subcommand provided.\nUsage:\n  {bin} servertest <password>\n  {bin} clienttest <message> <password>");
     }
 }
