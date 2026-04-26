@@ -794,12 +794,7 @@ mod tests {
 
         let (a_key, d_key, trusted) = make_state(TEST_A_KEY, TEST_D_KEY, vec![peer_addr]);
 
-        let server_task = tokio::spawn(recv_handler(
-            (server, peer_addr),
-            a_key,
-            d_key,
-            trusted,
-        ));
+        let server_task = tokio::spawn(recv_handler((server, peer_addr), a_key, d_key, trusted));
 
         // auth_outgoing sends the wrong key then reads the server's response.
         // When the server closes without responding, auth_outgoing returns Err(FailedToReadFromStream)
@@ -823,12 +818,7 @@ mod tests {
 
         let (a_key, d_key, trusted) = make_state(TEST_A_KEY, TEST_D_KEY, vec![peer_addr]);
 
-        let server_task = tokio::spawn(recv_handler(
-            (server, peer_addr),
-            a_key,
-            d_key,
-            trusted,
-        ));
+        let server_task = tokio::spawn(recv_handler((server, peer_addr), a_key, d_key, trusted));
 
         // Auth succeeds, then send 37 random bytes as the init header.
         client_auth(&mut client, TEST_A_KEY).await;
@@ -852,12 +842,7 @@ mod tests {
 
         let (a_key, d_key, trusted) = make_state(TEST_A_KEY, TEST_D_KEY, vec![peer_addr]);
 
-        let server_task = tokio::spawn(recv_handler(
-            (server, peer_addr),
-            a_key,
-            d_key,
-            trusted,
-        ));
+        let server_task = tokio::spawn(recv_handler((server, peer_addr), a_key, d_key, trusted));
 
         client_auth(&mut client, TEST_A_KEY).await;
         drop(client); // EOF on recv_handler's read_exact for the init header
@@ -887,12 +872,7 @@ mod tests {
 
         let (a_key, d_key, trusted) = make_state(TEST_A_KEY, TEST_D_KEY, vec![peer_addr]);
 
-        let server_task = tokio::spawn(recv_handler(
-            (server, peer_addr),
-            a_key,
-            d_key,
-            trusted,
-        ));
+        let server_task = tokio::spawn(recv_handler((server, peer_addr), a_key, d_key, trusted));
 
         // Auth: complete the handshake and obtain the ephemeral session key.
         let shared_hash = client_auth(&mut client, TEST_A_KEY).await;
@@ -927,12 +907,7 @@ mod tests {
 
         let (a_key, d_key, trusted) = make_state(TEST_A_KEY, TEST_D_KEY, vec![peer_addr]);
 
-        let server_task = tokio::spawn(recv_handler(
-            (server, peer_addr),
-            a_key,
-            d_key,
-            trusted,
-        ));
+        let server_task = tokio::spawn(recv_handler((server, peer_addr), a_key, d_key, trusted));
 
         let shared_hash = client_auth(&mut client, TEST_A_KEY).await;
 
@@ -973,10 +948,8 @@ mod tests {
         let (server_stream, peer_addr) = listener.accept().await.unwrap();
 
         // Server trusts the client's ephemeral addr; client trusts the server addr.
-        let (a_key_s, d_key_s, trusted_s) =
-            make_state(TEST_A_KEY, TEST_D_KEY, vec![client_addr]);
-        let (a_key_c, d_key_c, trusted_c) =
-            make_state(TEST_A_KEY, TEST_D_KEY, vec![server_addr]);
+        let (a_key_s, d_key_s, trusted_s) = make_state(TEST_A_KEY, TEST_D_KEY, vec![client_addr]);
+        let (a_key_c, d_key_c, trusted_c) = make_state(TEST_A_KEY, TEST_D_KEY, vec![server_addr]);
 
         // Spawn the server (recv_handler) — blocks waiting for the client's ECDH public key.
         let server_task = tokio::spawn(recv_handler(
@@ -1012,10 +985,8 @@ mod tests {
         let client_addr = outgoing.local_addr().unwrap();
         let (server_stream, peer_addr) = listener.accept().await.unwrap();
 
-        let (a_key_s, d_key_s, trusted_s) =
-            make_state(TEST_A_KEY, TEST_D_KEY, vec![client_addr]);
-        let (a_key_c, d_key_c, trusted_c) =
-            make_state(TEST_A_KEY, TEST_D_KEY, vec![server_addr]);
+        let (a_key_s, d_key_s, trusted_s) = make_state(TEST_A_KEY, TEST_D_KEY, vec![client_addr]);
+        let (a_key_c, d_key_c, trusted_c) = make_state(TEST_A_KEY, TEST_D_KEY, vec![server_addr]);
 
         let server_task = tokio::spawn(recv_handler(
             (server_stream, peer_addr),

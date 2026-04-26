@@ -10,6 +10,7 @@ use tokio::{io::AsyncReadExt, net::TcpStream, sync::RwLock};
 use tracing::{debug, error, info, warn};
 use zeroize::Zeroize;
 
+
 /// All errors that can occur during authentication.
 #[derive(Debug, PartialEq)]
 pub enum AuthErrors {

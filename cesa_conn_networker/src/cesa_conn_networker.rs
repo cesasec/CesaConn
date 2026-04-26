@@ -21,12 +21,13 @@ GET RID OF STORING KEYS IN RAM
 mod auth;
 mod tcp_networker;
 mod udp_networker;
+mod ipc;
 use std::{env, net::SocketAddr, sync::Arc};
 use tracing::{error, warn};
 use tracing_subscriber::EnvFilter;
 
 use cesa_conn_crypto::pswd_manager::derive_key;
-use tokio::{net::TcpListener, select, sync::RwLock};
+use tokio::{net::TcpListener, sync::RwLock};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -72,57 +73,41 @@ async fn main() {
                 let test_psw = args[2].as_bytes();
                 // Salt derived from the password itself — acceptable for testing only
                 let mut salt = [0u8; 32];
-                salt[0..test_psw.len()].copy_from_slice(test_psw);
+                let len = test_psw.len().min(32);
+                salt[0..len].copy_from_slice(&test_psw[..len]);
                 let a_key = Arc::new(RwLock::new(derive_key(test_psw, salt).unwrap()));
 
                 let listener = TcpListener::bind("0.0.0.0:3232").await.unwrap();
-                let trusted_addrs = Arc::new(RwLock::new(Vec::new()));
+                let trusted_addrs: Arc<RwLock<Vec<SocketAddr>>> = Arc::new(RwLock::new(Vec::new()));
                 let cancellation_token = CancellationToken::new();
-
-                let cancellation_token_clone = cancellation_token.clone();
-                let trusted_addrs_clone = trusted_addrs.clone();
                 let a_key_clone = a_key.clone();
 
                 // Background task: UDP peer discovery loop.
                 // Alternates between broadcasting presence and listening for responses
                 // so both sides can find each other regardless of who starts first.
                 tokio::spawn(async move {
+                    // Inner loop retries until a valid peer is found, skipping timeouts
+                    // and wrong-key peers without propagating those as fatal errors.
                     loop {
-                        // Inner loop retries until a valid peer is found, skipping timeouts
-                        // and wrong-key peers without propagating those as fatal errors.
-                        let incoming_addr = loop {
-                            udp_broadcast_presence(
-                                BROADCAST_NAME.as_bytes(),
-                                1,
-                                a_key_clone.clone(),
-                            )
+                        udp_broadcast_presence(BROADCAST_NAME.as_bytes(), 1, a_key_clone.clone())
                             .await
                             .unwrap();
-                            break match udp_find_broadcaster(
-                                3,
-                                BROADCAST_NAME.as_bytes(),
-                                a_key_clone.clone(),
-                            )
-                            .await
-                            {
-                                Ok(addr) => Ok(addr),
-                                Err(e) if e == UdpNetworkerErrors::Timeout => continue,
-                                Err(e) if e == UdpNetworkerErrors::FailedToDecryptTunnel => {
-                                    warn!("Someone tired to connect with wrong key");
-                                    continue;
-                                }
-                                Err(e) => Err(e),
+                        break match udp_find_broadcaster(
+                            3,
+                            BROADCAST_NAME.as_bytes(),
+                            a_key_clone.clone(),
+                        )
+                        .await
+                        {
+                            Ok(addr) => Ok(addr),
+                            Err(e) if e == UdpNetworkerErrors::Timeout => continue,
+                            Err(e) if e == UdpNetworkerErrors::FailedToDecryptTunnel => {
+                                warn!("Someone tired to connect with wrong key");
+                                continue;
                             }
-                            .unwrap();
-                        };
-                        // TODO: incoming_addr is pushed twice — once unconditionally here,
-                        // and once more in the select block below. One of these should be removed.
-                        trusted_addrs_clone.write().await.push(incoming_addr);
-
-                        // Check for cancellation before looping back to discover the next peer.
-                        select! {
-                            _ = cancellation_token_clone.cancelled() => break,
+                            Err(e) => Err(e),
                         }
+                        .unwrap();
                     }
                 });
 
@@ -130,7 +115,7 @@ async fn main() {
                     &listener,
                     a_key.clone(),
                     a_key.clone(),
-                    trusted_addrs,
+                    trusted_addrs.clone(),
                     cancellation_token.clone(),
                 )
                 .await
@@ -145,9 +130,12 @@ async fn main() {
                     return;
                 }
 
-                let test_psw = args[3].as_bytes();
+                let test_psw = args[2].as_bytes();
+                // Salt derived from the password itself — acceptable for testing only
                 let mut salt = [0u8; 32];
-                salt[0..test_psw.len()].copy_from_slice(test_psw);
+                let len = test_psw.len().min(32);
+                salt[0..len].copy_from_slice(&test_psw[..len]);
+
                 let a_key = Arc::new(RwLock::new(derive_key(test_psw, salt).unwrap()));
 
                 let a_key_clone = a_key.clone();
@@ -178,17 +166,12 @@ async fn main() {
                     break incoming_addr;
                 };
 
-                // Wait 2 seconds before adding to trusted_addrs — gives the server time to process
-                // our UDP broadcast and add us to its own trusted list before we attempt TCP.
-                // The lock is not held during the sleep; write() is only polled on the .await line.
                 let write_g = trusted_addrs.write();
-                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-
                 write_g.await.push(incoming_addr);
 
                 let cancellation_token = CancellationToken::new();
 
-                let message = args[2].as_str();
+                let message = args[2].as_bytes().to_vec();
 
                 // Server always listens on port 3232 — only the IP comes from UDP discovery
                 let connect_addr = SocketAddr::new(incoming_addr.ip(), 3232);
@@ -202,7 +185,7 @@ async fn main() {
                     cancellation_token,
                     connect_addr,
                     action_type,
-                    message.as_bytes().to_vec(),
+                    message,
                 )
                 .await
                 .unwrap();
@@ -211,10 +194,14 @@ async fn main() {
                 tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
             }
             unknown => {
-                error!("Unknown subcommand: '{unknown}'.\nUsage:\n  {bin} servertest <password>\n  {bin} clienttest <message> <password>");
+                error!(
+                    "Unknown subcommand: '{unknown}'.\nUsage:\n  {bin} servertest <password>\n  {bin} clienttest <message> <password>"
+                );
             }
         }
     } else {
-        error!("No subcommand provided.\nUsage:\n  {bin} servertest <password>\n  {bin} clienttest <message> <password>");
+        error!(
+            "No subcommand provided.\nUsage:\n  {bin} servertest <password>\n  {bin} clienttest <message> <password>"
+        );
     }
 }

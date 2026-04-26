@@ -1,23 +1,6 @@
 //! CesaConn terminal UI.
-//!
-//! This crate is both a library (exposing `App` and `run` for the daemon to
-//! spawn) and a standalone binary that connects to an already-running daemon
-//! via `ipc_client::connect()`.
-//!
-//! # Event model
-//! The TUI polls for daemon events (`DaemonEvent`) and keyboard input in a
-//! tight 50 ms loop.  All daemon state changes arrive through the `event_rx`
-//! channel and are applied to `App` before the next frame is drawn.
 
-pub mod ipc_client;
-
-use std::{
-    io,
-    sync::mpsc::{Receiver, Sender, TryRecvError},
-    time::Duration,
-};
-
-use cesa_conn_ipc::{ConfigKey, DaemonEvent, TuiCommand};
+use std::{io, time::Duration};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
@@ -118,11 +101,6 @@ pub struct App {
     active_popup: ActivePopup,
     input_buf: String,
 
-    // IPC channels — None when running without a daemon.
-    cmd_tx: Option<Sender<TuiCommand>>,
-    event_rx: Option<Receiver<DaemonEvent>>,
-    pub daemon_connected: bool,
-
     pub should_quit: bool,
 }
 
@@ -198,93 +176,12 @@ impl App {
             log_follow: true,
             active_popup: ActivePopup::None,
             input_buf: String::new(),
-            cmd_tx: None,
-            event_rx: None,
-            daemon_connected: false,
             should_quit: false,
         }
     }
 
-    /// Attach IPC channels produced by `ipc_client::connect()`.
-    ///
-    /// Must be called before `run()`. If not called, the TUI still renders
-    /// but all commands are silently dropped and no events are received.
-    pub fn connect_channels(
-        &mut self,
-        event_rx: Receiver<DaemonEvent>,
-        cmd_tx: Sender<TuiCommand>,
-    ) {
-        self.event_rx = Some(event_rx);
-        self.cmd_tx = Some(cmd_tx);
-        self.daemon_connected = true;
-    }
-
     pub fn push_log(&mut self, msg: impl Into<String>) {
         self.logs.push(msg.into());
-    }
-
-    fn send_command(&self, cmd: TuiCommand) {
-        if let Some(tx) = &self.cmd_tx {
-            let _ = tx.send(cmd);
-        }
-    }
-
-    /// Drain all pending daemon events. Called once per frame before drawing.
-    ///
-    /// Uses a `loop` + `try_recv` rather than collecting into a `Vec` first
-    /// because `try_recv` returns `TryRecvError::Disconnected` immediately when
-    /// the daemon socket thread exits, letting us update `daemon_connected`
-    /// without an extra allocation.
-    fn drain_daemon_events(&mut self) {
-        loop {
-            let result = match self.event_rx.as_ref() {
-                Some(rx) => rx.try_recv(),
-                None => return,
-            };
-            match result {
-                Ok(event) => self.handle_daemon_event(event),
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    self.daemon_connected = false;
-                    self.event_rx = None;
-                    self.push_log("[WARN] Lost connection to daemon");
-                    break;
-                }
-            }
-        }
-    }
-
-    fn handle_daemon_event(&mut self, event: DaemonEvent) {
-        match event {
-            DaemonEvent::DeviceConnected { addr } => {
-                let s = addr.to_string();
-                if let Some(d) = self.devices.iter_mut().find(|d| d.addr == s) {
-                    d.status = DeviceStatus::Connected;
-                } else {
-                    self.devices
-                        .push(Device { addr: s, status: DeviceStatus::Connected });
-                }
-            }
-            DaemonEvent::DeviceConnecting { addr } => {
-                let s = addr.to_string();
-                if let Some(d) = self.devices.iter_mut().find(|d| d.addr == s) {
-                    d.status = DeviceStatus::Connecting;
-                }
-            }
-            DaemonEvent::DeviceDisconnected { addr } => {
-                let s = addr.to_string();
-                if let Some(d) = self.devices.iter_mut().find(|d| d.addr == s) {
-                    d.status = DeviceStatus::Disconnected;
-                }
-            }
-            DaemonEvent::KeyConfigured { is_auth } => {
-                let label = if is_auth { "Auth key" } else { "Data key" };
-                if let Some(s) = self.settings_basic.iter_mut().find(|s| s.label == label) {
-                    s.kind = SettingKind::Secret { configured: true };
-                }
-            }
-            DaemonEvent::Log { message } => self.push_log(message),
-        }
     }
 
     fn active_settings(&self) -> &Vec<Setting> {
@@ -419,9 +316,6 @@ fn handle_input(app: &mut App) -> io::Result<()> {
                     .and_then(|i| app.devices.get(i))
                     .map(|d| d.addr.clone());
                 if let Some(addr_str) = addr_str {
-                    if let Ok(addr) = addr_str.parse() {
-                        app.send_command(TuiCommand::Disconnect { addr });
-                    }
                     let i = app.device_list_state.selected().unwrap();
                     if let Some(dev) = app.devices.get_mut(i) {
                         dev.status = DeviceStatus::Disconnected;
@@ -497,17 +391,13 @@ fn handle_add_device_input(app: &mut App, code: KeyCode) {
         KeyCode::Enter => {
             let addr_str = app.input_buf.trim().to_string();
             if !addr_str.is_empty() {
-                match addr_str.parse() {
-                    Ok(addr) => {
-                        app.send_command(TuiCommand::Connect { addr });
-                        app.devices.push(Device {
-                            addr: addr_str,
-                            status: DeviceStatus::Connecting,
-                        });
-                    }
-                    Err(_) => {
-                        app.push_log(format!("[ WARN] Invalid address: {}", addr_str));
-                    }
+                if addr_str.parse::<std::net::SocketAddr>().is_ok() {
+                    app.devices.push(Device {
+                        addr: addr_str,
+                        status: DeviceStatus::Connecting,
+                    });
+                } else {
+                    app.push_log(format!("[ WARN] Invalid address: {}", addr_str));
                 }
             }
             app.active_popup = ActivePopup::None;
@@ -546,36 +436,20 @@ fn handle_edit_setting_input(app: &mut App, code: KeyCode) {
 fn apply_setting_edit(app: &mut App, new_value: String) {
     let idx = app.settings_selected;
 
-    let (is_secret, is_text, label) = app
+    let (is_secret, is_text) = app
         .active_settings()
         .get(idx)
         .map(|s| (
             matches!(s.kind, SettingKind::Secret { .. }),
             s.kind == SettingKind::Text,
-            s.label,
         ))
         .unwrap_or_default();
 
     if is_secret {
-        let cmd = if label == "Auth key" {
-            TuiCommand::SetAuthKey { passphrase: new_value }
-        } else {
-            TuiCommand::SetDataKey { passphrase: new_value }
-        };
-        app.send_command(cmd);
         if let Some(s) = app.active_settings_mut().get_mut(idx) {
             s.kind = SettingKind::Secret { configured: true };
         }
     } else if is_text {
-        let config_key = match label {
-            "Listen address" => ConfigKey::ListenAddress,
-            "Listen port" => ConfigKey::ListenPort,
-            _ => ConfigKey::UdpBroadcastDuration,
-        };
-        app.send_command(TuiCommand::SetConfig {
-            key: config_key,
-            value: new_value.clone(),
-        });
         if let Some(s) = app.active_settings_mut().get_mut(idx) {
             s.value = new_value;
         }
@@ -844,25 +718,17 @@ fn render_statusbar(frame: &mut Frame, area: Rect, app: &App) {
         Tab::Logs => " q:Quit  Tab:Switch  ↑↓:Scroll  f:Follow ",
     };
 
-    let connected_devices = app
+    let connected = app
         .devices
         .iter()
         .filter(|d| d.status == DeviceStatus::Connected)
         .count();
 
-    let (daemon_indicator, daemon_color) = if app.daemon_connected {
-        ("● daemon", Color::Green)
-    } else {
-        ("○ daemon", Color::DarkGray)
-    };
-
-    let devices_str = format!(" {} connected ", connected_devices);
-
-    let daemon_str = format!(" {}  {}", daemon_indicator, devices_str.trim());
+    let right_str = format!(" {} connected ", connected);
 
     let [help_area, right_area] = Layout::horizontal([
         Constraint::Min(0),
-        Constraint::Length(daemon_str.len() as u16 + 1),
+        Constraint::Length(right_str.len() as u16),
     ])
     .areas(area);
 
@@ -871,17 +737,9 @@ fn render_statusbar(frame: &mut Frame, area: Rect, app: &App) {
         help_area,
     );
     frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(
-                format!(" {}", daemon_indicator),
-                Style::default().fg(daemon_color),
-            ),
-            Span::styled(
-                format!("  {} connected ", connected_devices),
-                Style::default().fg(Color::Green),
-            ),
-        ]))
-        .alignment(Alignment::Right),
+        Paragraph::new(right_str)
+            .style(Style::default().fg(Color::Green))
+            .alignment(Alignment::Right),
         right_area,
     );
 }
@@ -1014,11 +872,7 @@ fn render_security_warning_popup(
 
 pub fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> io::Result<()> {
     loop {
-        // Drain daemon events before drawing so the frame always reflects the
-        // latest state rather than being one frame behind.
-        app.drain_daemon_events();
         terminal.draw(|frame| ui(frame, app))?;
-        // 50 ms poll keeps CPU near zero when idle while still feeling responsive.
         if event::poll(Duration::from_millis(50))? {
             handle_input(app)?;
         }
@@ -1033,28 +887,12 @@ pub fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> io::Result
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cesa_conn_ipc::DaemonEvent;
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-    use std::sync::mpsc::channel;
-
-    fn test_addr() -> SocketAddr {
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 3232)
-    }
-
-    fn connected_app() -> (App, std::sync::mpsc::Sender<DaemonEvent>) {
-        let mut app = App::new();
-        let (event_tx, event_rx) = channel();
-        let (cmd_tx, _cmd_rx) = channel();
-        app.connect_channels(event_rx, cmd_tx);
-        (app, event_tx)
-    }
 
     // ── App::new ──────────────────────────────────────────────────────────
 
     #[test]
-    fn new_starts_without_daemon() {
+    fn new_starts_with_empty_state() {
         let app = App::new();
-        assert!(!app.daemon_connected);
         assert!(app.devices.is_empty());
         assert!(app.logs.is_empty());
         assert!(!app.should_quit);
@@ -1075,114 +913,6 @@ mod tests {
         let labels: Vec<_> = app.settings_advanced.iter().map(|s| s.label).collect();
         assert!(labels.contains(&"Listen address"));
         assert!(labels.contains(&"Listen port"));
-    }
-
-    // ── connect_channels ──────────────────────────────────────────────────
-
-    #[test]
-    fn connect_channels_marks_daemon_connected() {
-        let (app, _tx) = connected_app();
-        assert!(app.daemon_connected);
-    }
-
-    // ── DaemonEvent handling ──────────────────────────────────────────────
-
-    #[test]
-    fn device_connected_event_adds_device() {
-        let (mut app, tx) = connected_app();
-        let addr = test_addr();
-        tx.send(DaemonEvent::DeviceConnected { addr }).unwrap();
-        app.drain_daemon_events();
-        assert_eq!(app.devices.len(), 1);
-        assert_eq!(app.devices[0].addr, addr.to_string());
-        assert_eq!(app.devices[0].status, DeviceStatus::Connected);
-    }
-
-    #[test]
-    fn device_connected_event_updates_existing_device() {
-        // If the device was already in the list (e.g. from a Connect command),
-        // the event should update its status rather than adding a duplicate.
-        let (mut app, tx) = connected_app();
-        let addr = test_addr();
-        app.devices.push(Device { addr: addr.to_string(), status: DeviceStatus::Connecting });
-        tx.send(DaemonEvent::DeviceConnected { addr }).unwrap();
-        app.drain_daemon_events();
-        assert_eq!(app.devices.len(), 1);
-        assert_eq!(app.devices[0].status, DeviceStatus::Connected);
-    }
-
-    #[test]
-    fn device_disconnected_event_updates_status() {
-        let (mut app, tx) = connected_app();
-        let addr = test_addr();
-        app.devices.push(Device { addr: addr.to_string(), status: DeviceStatus::Connected });
-        tx.send(DaemonEvent::DeviceDisconnected { addr }).unwrap();
-        app.drain_daemon_events();
-        assert_eq!(app.devices[0].status, DeviceStatus::Disconnected);
-    }
-
-    #[test]
-    fn device_connecting_event_updates_status() {
-        let (mut app, tx) = connected_app();
-        let addr = test_addr();
-        app.devices.push(Device { addr: addr.to_string(), status: DeviceStatus::Disconnected });
-        tx.send(DaemonEvent::DeviceConnecting { addr }).unwrap();
-        app.drain_daemon_events();
-        assert_eq!(app.devices[0].status, DeviceStatus::Connecting);
-    }
-
-    #[test]
-    fn key_configured_auth_updates_setting() {
-        let (mut app, tx) = connected_app();
-        tx.send(DaemonEvent::KeyConfigured { is_auth: true }).unwrap();
-        app.drain_daemon_events();
-        let s = app.settings_basic.iter().find(|s| s.label == "Auth key").unwrap();
-        assert_eq!(s.kind, SettingKind::Secret { configured: true });
-    }
-
-    #[test]
-    fn key_configured_data_updates_setting() {
-        let (mut app, tx) = connected_app();
-        tx.send(DaemonEvent::KeyConfigured { is_auth: false }).unwrap();
-        app.drain_daemon_events();
-        let s = app.settings_basic.iter().find(|s| s.label == "Data key").unwrap();
-        assert_eq!(s.kind, SettingKind::Secret { configured: true });
-    }
-
-    #[test]
-    fn log_event_appends_to_logs() {
-        let (mut app, tx) = connected_app();
-        tx.send(DaemonEvent::Log { message: "hello".into() }).unwrap();
-        app.drain_daemon_events();
-        assert_eq!(app.logs, vec!["hello"]);
-    }
-
-    #[test]
-    fn multiple_events_drained_in_one_call() {
-        let (mut app, tx) = connected_app();
-        tx.send(DaemonEvent::Log { message: "a".into() }).unwrap();
-        tx.send(DaemonEvent::Log { message: "b".into() }).unwrap();
-        tx.send(DaemonEvent::Log { message: "c".into() }).unwrap();
-        app.drain_daemon_events();
-        assert_eq!(app.logs, vec!["a", "b", "c"]);
-    }
-
-    // ── Channel disconnect detection ──────────────────────────────────────
-
-    #[test]
-    fn channel_drop_clears_daemon_connected() {
-        let (mut app, tx) = connected_app();
-        drop(tx); // simulate daemon exit
-        app.drain_daemon_events();
-        assert!(!app.daemon_connected);
-    }
-
-    #[test]
-    fn channel_drop_logs_warning() {
-        let (mut app, tx) = connected_app();
-        drop(tx);
-        app.drain_daemon_events();
-        assert!(app.logs.iter().any(|l| l.contains("Lost connection")));
     }
 
     // ── Settings display ──────────────────────────────────────────────────

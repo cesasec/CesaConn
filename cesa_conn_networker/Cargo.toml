@@ -11,7 +11,6 @@ path = "src/cesa_conn_networker.rs"
 btleplug = "0.11.8"
 tokio = { version = "1.50.0", features = ["full"] }
 cesa_conn_crypto = { path = "../cesa_conn_crypto" }
-cesa_conn_ipc = { path = "../cesa_conn_ipc" }
 tokio-util = "0.7.18"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
