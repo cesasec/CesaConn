@@ -15,4 +15,6 @@ tokio-util = "0.7.18"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 zeroize = "1.8.2"
+serde = "1.0.228"
+bincode = "3.0.0"
 

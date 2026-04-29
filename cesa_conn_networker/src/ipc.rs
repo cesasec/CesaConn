@@ -1,16 +1,29 @@
+#[cfg(unix)]
+use std::io::{Read, Write};
 /*
 TODO:
+make types for diffrent ipc actions
+IPC client
 IPC daemon
+IPC for windows
 */
-
-use std::fmt;
+use serde::{Serialize, Serializer};
+use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
+use std::{fmt, fs::File};
 use std::{
-    fs::{read_dir, read_to_string, remove_file},
+    fs::{Permissions, read_dir, read_to_string, remove_file, set_permissions},
     path::Path,
     process::id,
 };
+use tokio::io::Interest;
 use tracing::{debug, error};
+
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
+#[repr(u8)]
+pub enum ActionType {
+    Default = 0x00,
+}
 
 #[derive(Debug, PartialEq)]
 pub enum IcpErrors {
@@ -25,6 +38,14 @@ pub enum IcpErrors {
     FailedToReadProcessName,
     FailedToCheckIfProcessExists,
     FailedToRemoveFile,
+    FailedToBindSocket,
+    FailedToSetPermissions,
+    DaemonAlreadyRunning,
+    FailedToCheckIfRunning,
+    FailedToConnectToPipe,
+    FailedToCheckStreamState,
+    NotWritable,
+    FailedToWriteToStream,
 }
 
 impl fmt::Display for IcpErrors {
@@ -41,6 +62,14 @@ impl fmt::Display for IcpErrors {
             Self::FailedToReadProcessName => "failed to fetch process name",
             Self::FailedToCheckIfProcessExists => "failed to check if process exists",
             Self::FailedToRemoveFile => "failed to remove file",
+            Self::FailedToBindSocket => "failed to bind socket",
+            Self::FailedToSetPermissions => "failed to set permissions",
+            Self::DaemonAlreadyRunning => "daemon is already running",
+            Self::FailedToCheckIfRunning => "failed to check if daemon is running",
+            Self::FailedToConnectToPipe => "failed to connect to the pipe",
+            Self::FailedToCheckStreamState => "failed to check stream state",
+            Self::NotWritable => "stream is not writable",
+            Self::FailedToWriteToStream => "failed to write data to stream",
         };
         write!(f, "{}", msg)
     }
@@ -108,8 +137,7 @@ pub fn process_exists(name: String) -> Result<bool, IcpErrors> {
 }
 
 #[cfg(unix)]
-use tokio::net::UnixListener;
-pub fn create_secure_pipe() -> Result<(), IcpErrors> {
+pub fn is_running() -> Result<bool, IcpErrors> {
     let path = socket_path().map_err(|_| IcpErrors::FailedToFetchSocketPath)?;
 
     let proc_name = get_self_name().map_err(|_| IcpErrors::FailedToGetSelfName)?;
@@ -118,14 +146,52 @@ pub fn create_secure_pipe() -> Result<(), IcpErrors> {
         process_exists(proc_name).map_err(|_| IcpErrors::FailedToCheckIfProcessExists)?;
 
     if Path::new(&path).exists() {
-        if !process_exists {
-            remove_file(path).map_err(|_| IcpErrors::FailedToRemoveFile)?;
+        if process_exists {
+            return Ok(true);
         }
     }
+    Ok(false)
+}
+
+#[cfg(unix)]
+use tokio::net::UnixListener;
+pub fn create_secure_pipe() -> Result<UnixListener, IcpErrors> {
+    let path = socket_path().map_err(|_| IcpErrors::FailedToFetchSocketPath)?;
+
+    let is_daemon_running = is_running().map_err(|_| IcpErrors::FailedToCheckIfRunning)?;
+
+    if !is_daemon_running {
+        if Path::new(&path).exists() {
+            remove_file(&path).map_err(|_| IcpErrors::FailedToRemoveFile)?;
+        }
+    }
+
+    let socket = UnixListener::bind(&path).map_err(|_| IcpErrors::FailedToBindSocket)?;
+
+    set_permissions(&path, Permissions::from_mode(0o600))
+        .map_err(|_| IcpErrors::FailedToSetPermissions)?;
+
+    Ok(socket)
+}
+
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
+pub fn ipc_send(action_type: ActionType, data: [u8]) -> Result<(), IcpErrors> {
+    let path = socket_path().map_err(|_| IcpErrors::FailedToFetchSocketPath)?;
+    let mut stream = UnixStream::connect(path).map_err(|_| IcpErrors::FailedToConnectToPipe)?;
+    let mut final_data = [0u8; data.len() + 1];
+
+    final_data[0] = action_type as u8;
+    final_data[1..data.len() + 1] = data;
+
+    stream
+        .write_all(&data)
+        .map_err(|_| IcpErrors::FailedToWriteToStream)?;
 
     Ok(())
 }
 
+#[cfg(unix)]
 #[cfg(target_os = "windows")]
 pub fn create_secure_pipe() -> Result<(), IcpErrors> {
     Ok(())
