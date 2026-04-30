@@ -216,10 +216,12 @@ Auth Exchange (60 bytes per direction):
 - [x] IP allowlist trusted device enforcement
 - [x] Full offline / serverless operation
 - [x] Structured tracing (`RUST_LOG` configurable)
+- [x] IPC daemon detection and secure local Unix socket transport
 
 ### In Progress
 - [ ] Ed25519 packet signing integration
 - [ ] TCP streaming for large file transfers
+- [ ] Terminal UI (ratatui-based)
 
 ### Planned for v1.0
 - [ ] File synchronization
@@ -263,13 +265,19 @@ CesaConn/
 │   │   └── lib.rs
 │   └── Cargo.toml
 │
-└── cesa_conn_networker/     # Networking module
+├── cesa_conn_networker/     # Networking module
+│   ├── src/
+│   │   ├── auth.rs                    # 5-step mutual authentication handshake
+│   │   ├── udp_networker.rs           # Encrypted device discovery (UDP broadcast)
+│   │   ├── tcp_networker.rs           # Double-encrypted data transfer (TCP)
+│   │   ├── ipc.rs                     # Secure local IPC via Unix domain socket
+│   │   └── cesa_conn_networker.rs     # Binary entry point (servertest / clienttest)
+│   └── Cargo.toml
+│
+└── cesa_conn_tui/           # Terminal UI module
     ├── src/
-    │   ├── auth.rs           # 5-step mutual authentication handshake
-    │   ├── udp_networker.rs  # Encrypted device discovery (UDP broadcast)
-    │   ├── tcp_networker.rs  # Double-encrypted data transfer (TCP)
-    │   ├── cesa_conn_networker.rs  # Entry point / test runner
-    │   └── lib.rs
+    │   ├── lib.rs            # App state and event loop
+    │   └── main.rs           # TUI entry point (ratatui + crossterm)
     └── Cargo.toml
 ```
 
@@ -303,16 +311,16 @@ cargo test -p cesa_conn_networker
 
 ```bash
 # Terminal 1 — server device
-cargo run -- servertest
+cargo run -p cesa_conn_networker -- servertest <password>
 
 # Terminal 2 — client device
-cargo run -- clienttest
+cargo run -p cesa_conn_networker -- clienttest <message> <password>
 ```
 
 Tracing verbosity is configurable via `RUST_LOG`:
 
 ```bash
-RUST_LOG=cesa_conn=trace cargo run -- servertest
+RUST_LOG=cesa_conn=trace cargo run -p cesa_conn_networker -- servertest <password>
 ```
 
 ---
