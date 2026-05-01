@@ -1,7 +1,7 @@
 [workspace]
 members = [
     "cesa_conn_crypto",
-    "cesa_conn_networker",
+    "cesa_conn_networker", "cesa_conn_system",
     "cesa_conn_tui",
 ]
 resolver = "3"

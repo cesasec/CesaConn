@@ -1,6 +1,5 @@
 //TODO: Change find broadcaster to loop and check if the ip isnt local machine
 
-
 use core::fmt;
 use core::net::SocketAddr;
 use std::sync::Arc;
@@ -81,36 +80,38 @@ pub async fn udp_broadcast_presence(
         duration
     };
 
-    debug!(requested_duration = duration, capped_duration = duration, "udp_broadcast_presence started");
+    debug!(
+        requested_duration = duration,
+        capped_duration = duration,
+        "udp_broadcast_presence started"
+    );
 
     // Bind to all interfaces on port 6363
-    let socket = UdpSocket::bind("0.0.0.0:6363")
-        .await
-        .map_err(|e| {
-            error!(error = %e, addr = "0.0.0.0:6363", "failed to bind UDP socket for broadcast");
-            UdpNetworkerErrors::FailedToBindSocket
-        })?;
+    let socket = UdpSocket::bind("0.0.0.0:6363").await.map_err(|e| {
+        error!(error = %e, addr = "0.0.0.0:6363", "failed to bind UDP socket for broadcast");
+        UdpNetworkerErrors::FailedToBindSocket
+    })?;
 
     debug!(local_addr = "0.0.0.0:6363", "UDP broadcast socket bound");
 
     // Enable broadcast mode — required to send packets to 255.255.255.255
-    socket
-        .set_broadcast(true)
-        .map_err(|e| {
-            error!(error = %e, "failed to enable broadcast mode on UDP socket");
-            UdpNetworkerErrors::FailedToSetBroadcastMode
-        })?;
+    socket.set_broadcast(true).map_err(|e| {
+        error!(error = %e, "failed to enable broadcast mode on UDP socket");
+        UdpNetworkerErrors::FailedToSetBroadcastMode
+    })?;
 
-    info!("UDP broadcast mode enabled, will send {} packets to 255.255.255.255:3636", duration);
+    info!(
+        "UDP broadcast mode enabled, will send {} packets to 255.255.255.255:3636",
+        duration
+    );
 
     for tick in 0..duration {
         let auth_key = &mut a_key.read().await.clone();
 
-        let e_msg = encrypt_tunnel(&auth_key, message)
-            .map_err(|e| {
-                error!(error = %e, tick, "failed to encrypt broadcast message");
-                UdpNetworkerErrors::FailedToEncryptTunnel
-            })?;
+        let e_msg = encrypt_tunnel(&auth_key, message).map_err(|e| {
+            error!(error = %e, tick, "failed to encrypt broadcast message");
+            UdpNetworkerErrors::FailedToEncryptTunnel
+        })?;
         auth_key.zeroize();
 
         // Send presence packet to the entire local network
@@ -141,14 +142,15 @@ pub async fn udp_broadcast_presence(
     }
 
     // Disable broadcast mode after finishing — good practice to clean up
-    socket
-        .set_broadcast(false)
-        .map_err(|e| {
-            error!(error = %e, "failed to disable broadcast mode on UDP socket");
-            UdpNetworkerErrors::FailedToSetBroadcastMode
-        })?;
+    socket.set_broadcast(false).map_err(|e| {
+        error!(error = %e, "failed to disable broadcast mode on UDP socket");
+        UdpNetworkerErrors::FailedToSetBroadcastMode
+    })?;
 
-    info!("UDP broadcast mode disabled, broadcast complete ({} packets sent)", duration);
+    info!(
+        "UDP broadcast mode disabled, broadcast complete ({} packets sent)",
+        duration
+    );
 
     Ok(())
 }
@@ -168,28 +170,35 @@ pub async fn udp_find_broadcaster(
         duration
     };
 
-    debug!(timeout_secs = duration, "udp_find_broadcaster started, waiting for broadcast packets");
+    debug!(
+        timeout_secs = duration,
+        "udp_find_broadcaster started, waiting for broadcast packets"
+    );
 
     // Bind to all interfaces on port 6363 — same port as broadcaster
-    let socket = UdpSocket::bind("0.0.0.0:3636")
-        .await
-        .map_err(|e| {
-            error!(error = %e, addr = "0.0.0.0:3636", "failed to bind UDP socket for discovery");
-            UdpNetworkerErrors::FailedToBindSocket
-        })?;
+    let socket = UdpSocket::bind("0.0.0.0:3636").await.map_err(|e| {
+        error!(error = %e, addr = "0.0.0.0:3636", "failed to bind UDP socket for discovery");
+        UdpNetworkerErrors::FailedToBindSocket
+    })?;
 
     debug!(local_addr = "0.0.0.0:3636", "UDP discovery socket bound");
 
     // Receive buffer — max 1024 bytes per packet
     let mut buf = [0; 1024];
 
-    info!(timeout_secs = duration, "searching for CesaConn devices on network...");
+    info!(
+        timeout_secs = duration,
+        "searching for CesaConn devices on network..."
+    );
 
     // Wait for incoming packet — abort if duration expires
     let recv_result = timeout(Duration::from_secs(duration), socket.recv_from(&mut buf))
         .await
         .map_err(|_| {
-            warn!(timeout_secs = duration, "UDP discovery timed out — no device responded");
+            warn!(
+                timeout_secs = duration,
+                "UDP discovery timed out — no device responded"
+            );
             UdpNetworkerErrors::Timeout
         })?; // timeout expired;
 
@@ -410,15 +419,43 @@ mod tests {
     /// All `UdpNetworkerErrors` variants must produce a non-empty `Display` string.
     #[test]
     fn test_error_display() {
-        assert!(!UdpNetworkerErrors::FailedToBindSocket.to_string().is_empty());
-        assert!(!UdpNetworkerErrors::FailedToSetBroadcastMode.to_string().is_empty());
-        assert!(!UdpNetworkerErrors::FailedToSendBroadcast.to_string().is_empty());
+        assert!(
+            !UdpNetworkerErrors::FailedToBindSocket
+                .to_string()
+                .is_empty()
+        );
+        assert!(
+            !UdpNetworkerErrors::FailedToSetBroadcastMode
+                .to_string()
+                .is_empty()
+        );
+        assert!(
+            !UdpNetworkerErrors::FailedToSendBroadcast
+                .to_string()
+                .is_empty()
+        );
         assert!(!UdpNetworkerErrors::Timeout.to_string().is_empty());
-        assert!(!UdpNetworkerErrors::FailedToFetchResult.to_string().is_empty());
+        assert!(
+            !UdpNetworkerErrors::FailedToFetchResult
+                .to_string()
+                .is_empty()
+        );
         assert!(!UdpNetworkerErrors::DataTooBig.to_string().is_empty());
         assert!(!UdpNetworkerErrors::UnknownDevice.to_string().is_empty());
-        assert!(!UdpNetworkerErrors::FailedToEncryptTunnel.to_string().is_empty());
-        assert!(!UdpNetworkerErrors::FailedToDecryptTunnel.to_string().is_empty());
-        assert!(!UdpNetworkerErrors::FailedToConvertU8ToString.to_string().is_empty());
+        assert!(
+            !UdpNetworkerErrors::FailedToEncryptTunnel
+                .to_string()
+                .is_empty()
+        );
+        assert!(
+            !UdpNetworkerErrors::FailedToDecryptTunnel
+                .to_string()
+                .is_empty()
+        );
+        assert!(
+            !UdpNetworkerErrors::FailedToConvertU8ToString
+                .to_string()
+                .is_empty()
+        );
     }
 }

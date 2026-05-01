@@ -1,14 +1,14 @@
 //! CesaConn terminal UI.
 
-use std::{io, time::Duration};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::{
+    Frame,
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Clear, List, ListItem, ListState, Paragraph, Tabs},
-    Frame,
 };
+use std::{io, time::Duration};
 
 // ── Data types ────────────────────────────────────────────────────────────────
 
@@ -78,7 +78,10 @@ enum ActivePopup {
     None,
     AddDevice,
     EditSetting,
-    SecurityWarning { section: SettingsSection, idx: usize },
+    SecurityWarning {
+        section: SettingsSection,
+        idx: usize,
+    },
 }
 
 // ── App state ─────────────────────────────────────────────────────────────────
@@ -238,7 +241,13 @@ impl App {
         let i = self
             .device_list_state
             .selected()
-            .map(|i| if i == 0 { self.devices.len() - 1 } else { i - 1 })
+            .map(|i| {
+                if i == 0 {
+                    self.devices.len() - 1
+                } else {
+                    i - 1
+                }
+            })
             .unwrap_or(0);
         self.device_list_state.select(Some(i));
     }
@@ -259,8 +268,7 @@ impl App {
     fn prev_setting(&mut self) {
         let len = self.active_settings().len();
         if len > 0 {
-            self.settings_selected =
-                self.settings_selected.checked_sub(1).unwrap_or(len - 1);
+            self.settings_selected = self.settings_selected.checked_sub(1).unwrap_or(len - 1);
         }
     }
 }
@@ -439,10 +447,12 @@ fn apply_setting_edit(app: &mut App, new_value: String) {
     let (is_secret, is_text) = app
         .active_settings()
         .get(idx)
-        .map(|s| (
-            matches!(s.kind, SettingKind::Secret { .. }),
-            s.kind == SettingKind::Text,
-        ))
+        .map(|s| {
+            (
+                matches!(s.kind, SettingKind::Secret { .. }),
+                s.kind == SettingKind::Text,
+            )
+        })
         .unwrap_or_default();
 
     if is_secret {
@@ -541,8 +551,7 @@ fn render_content(frame: &mut Frame, area: Rect, app: &mut App) {
 
 fn render_devices(frame: &mut Frame, area: Rect, app: &mut App) {
     let [list_area, detail_area] =
-        Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)])
-            .areas(area);
+        Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)]).areas(area);
 
     let items: Vec<ListItem> = app
         .devices
@@ -697,7 +706,11 @@ fn render_logs(frame: &mut Frame, area: Rect, app: &mut App) {
         })
         .collect();
 
-    let title = if app.log_follow { " Logs [follow] " } else { " Logs " };
+    let title = if app.log_follow {
+        " Logs [follow] "
+    } else {
+        " Logs "
+    };
 
     frame.render_widget(
         Paragraph::new(lines)
@@ -766,10 +779,7 @@ fn render_add_popup(frame: &mut Frame, area: Rect, app: &App) {
         popup,
     );
 
-    frame.set_cursor_position((
-        popup.x + 2 + app.input_buf.len() as u16,
-        popup.y + 1,
-    ));
+    frame.set_cursor_position((popup.x + 2 + app.input_buf.len() as u16, popup.y + 1));
 }
 
 fn render_edit_setting_popup(frame: &mut Frame, area: Rect, app: &App) {
@@ -806,10 +816,7 @@ fn render_edit_setting_popup(frame: &mut Frame, area: Rect, app: &App) {
         popup,
     );
 
-    frame.set_cursor_position((
-        popup.x + 2 + display_input.len() as u16,
-        popup.y + 1,
-    ));
+    frame.set_cursor_position((popup.x + 2 + display_input.len() as u16, popup.y + 1));
 }
 
 fn render_security_warning_popup(
@@ -823,8 +830,12 @@ fn render_security_warning_popup(
         SettingsSection::Basic => &app.settings_basic,
         SettingsSection::Advanced => &app.settings_advanced,
     };
-    let Some(setting) = settings.get(idx) else { return };
-    let Some(warn_msg) = setting.warn_message else { return };
+    let Some(setting) = settings.get(idx) else {
+        return;
+    };
+    let Some(warn_msg) = setting.warn_message else {
+        return;
+    };
 
     let w = 60u16.min(area.width);
     let h = 11u16.min(area.height);
@@ -849,9 +860,17 @@ fn render_security_warning_popup(
     )));
     lines.push(Line::from(""));
     lines.push(Line::from(vec![
-        Span::styled("  y", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "  y",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ),
         Span::styled(": confirm   ", Style::default().fg(Color::DarkGray)),
-        Span::styled("Esc/n", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "Esc/n",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(": cancel", Style::default().fg(Color::DarkGray)),
     ]));
 
@@ -943,21 +962,41 @@ mod tests {
 
     #[test]
     fn bool_setting_shows_on_off() {
-        let on = Setting { label: "x", kind: SettingKind::Bool(true), value: String::new(), warn_message: None };
-        let off = Setting { label: "x", kind: SettingKind::Bool(false), value: String::new(), warn_message: None };
+        let on = Setting {
+            label: "x",
+            kind: SettingKind::Bool(true),
+            value: String::new(),
+            warn_message: None,
+        };
+        let off = Setting {
+            label: "x",
+            kind: SettingKind::Bool(false),
+            value: String::new(),
+            warn_message: None,
+        };
         assert_eq!(on.display_value().0, "on");
         assert_eq!(off.display_value().0, "off");
     }
 
     #[test]
     fn text_setting_empty_shows_not_set() {
-        let s = Setting { label: "x", kind: SettingKind::Text, value: String::new(), warn_message: None };
+        let s = Setting {
+            label: "x",
+            kind: SettingKind::Text,
+            value: String::new(),
+            warn_message: None,
+        };
         assert_eq!(s.display_value().0, "[not set]");
     }
 
     #[test]
     fn text_setting_with_value_shows_value() {
-        let s = Setting { label: "x", kind: SettingKind::Text, value: "0.0.0.0".into(), warn_message: None };
+        let s = Setting {
+            label: "x",
+            kind: SettingKind::Text,
+            value: "0.0.0.0".into(),
+            warn_message: None,
+        };
         assert_eq!(s.display_value().0, "0.0.0.0");
     }
 

@@ -7,13 +7,13 @@ use tracing::{debug, error};
 #[derive(Debug)]
 pub enum SaltError {
     /// OS failed to provide cryptographically secure random bytes
-    FailedToGenerate
+    FailedToGenerate,
 }
 
 impl fmt::Display for SaltError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            SaltError::FailedToGenerate => write!(f, "Failed to generate salt")
+            SaltError::FailedToGenerate => write!(f, "Failed to generate salt"),
         }
     }
 }
@@ -33,11 +33,10 @@ pub fn generate_salt() -> Result<[u8; 32], SaltError> {
     // Most secure RNG available in software
     let mut rng = SysRng::default();
 
-    rng.try_fill_bytes(&mut salt)
-        .map_err(|e| {
-            error!(error = %e, "OS failed to provide random bytes for salt generation");
-            SaltError::FailedToGenerate
-        })?;
+    rng.try_fill_bytes(&mut salt).map_err(|e| {
+        error!(error = %e, "OS failed to provide random bytes for salt generation");
+        SaltError::FailedToGenerate
+    })?;
 
     debug!("32-byte salt generated successfully");
     Ok(salt)

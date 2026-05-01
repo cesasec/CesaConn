@@ -3,6 +3,7 @@
 
 ---------------
 
+ADD SALT SYNCING
 CLIPBOARD SYNC
 FOLDER SYNC
 
@@ -19,9 +20,9 @@ GET RID OF STORING KEYS IN RAM
  */
 
 mod auth;
+mod ipc;
 mod tcp_networker;
 mod udp_networker;
-mod ipc;
 use std::{env, net::SocketAddr, sync::Arc};
 use tracing::{error, warn};
 use tracing_subscriber::EnvFilter;
