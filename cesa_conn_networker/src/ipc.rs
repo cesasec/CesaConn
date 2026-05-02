@@ -12,21 +12,25 @@
 // - Add IPC client functionality
 // - Add IPC daemon functionality
 // - Add Windows support (named pipes)
+// - Add SO_PEERCRED verification by looking at GID and /proc/{pid}/comm
+// - Enchance is_running() by hardcoding process name and GID or add const
 
-use std::{
-    io::{Read, Write},
-    sync::Arc,
-};
 use std::fmt;
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::SocketAddr;
 use std::{
     fs::{Permissions, read_dir, read_to_string, remove_file, set_permissions},
     path::Path,
     process::id,
 };
+use std::{
+    io::{Read, Write},
+    sync::Arc,
+};
+#[cfg(unix)]
+use std::{net::Ipv4Addr, os::unix::fs::PermissionsExt};
 use tokio::select;
+#[cfg(unix)]
+use tokio::task::spawn_blocking;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     sync::RwLock,
@@ -48,6 +52,8 @@ pub enum ActionType {
     UpdateAuthPassword = 0x01,
     /// Request to update the data encryption password
     UpdateDataPassword = 0x02,
+    AddTrustedDevice = 0x03,
+    SyncData = 0x04,
 }
 
 impl ActionType {
@@ -67,6 +73,8 @@ impl ActionType {
             0x00 => Some(Self::Default),
             0x01 => Some(Self::UpdateAuthPassword),
             0x02 => Some(Self::UpdateDataPassword),
+            0x03 => Some(Self::AddTrustedDevice),
+            0x04 => Some(Self::SyncData),
             _ => None,
         }
     }
@@ -128,6 +136,9 @@ pub enum IpcErrors {
     ConfirmationByteNotReceived,
     /// Failed to get data from client
     FailedToRecvData,
+    FailedToHandleData,
+    DataTooLarge,
+    NoData,
 }
 
 impl fmt::Display for IpcErrors {
@@ -158,6 +169,9 @@ impl fmt::Display for IpcErrors {
             Self::FailedToReadDataFromStream => "failed to read data from ipc stream",
             Self::ConfirmationByteNotReceived => "confirmation byte not received",
             Self::FailedToRecvData => "failed to get data from client",
+            Self::FailedToHandleData => "failed to handle data from ipc client",
+            Self::DataTooLarge => "data from cllient is too large",
+            Self::NoData => "there's no data",
         };
         write!(f, "{}", msg)
     }
@@ -359,7 +373,7 @@ pub fn create_secure_pipe() -> Result<UnixListener, IpcErrors> {
 pub async fn ipc_recv(
     a_key: Arc<RwLock<[u8; 32]>>,
     d_key: Arc<RwLock<[u8; 32]>>,
-    trusted_addrs: Arc<RwLock<SocketAddr>>,
+    trusted_addrs: Arc<RwLock<Vec<std::net::SocketAddr>>>,
     incoming_connection: (tokio::net::UnixStream, tokio::net::unix::SocketAddr),
 ) -> Result<(), IpcErrors> {
     let (mut stream, _addr) = incoming_connection;
@@ -372,7 +386,18 @@ pub async fn ipc_recv(
         .await
         .map_err(|_| IpcErrors::FailedToReadDataFromStream)?;
 
-    debug!(size = u64::from_le_bytes(size_buffer), "message size read, sending confirmation");
+    debug!(
+        size = u64::from_le_bytes(size_buffer),
+        "message size read, sending confirmation"
+    );
+
+    let size = u64::from_le_bytes(size_buffer);
+
+    if size > 64 * 1024 {
+        return Err(IpcErrors::DataTooLarge);
+    } else if size == 0 {
+        return Err(IpcErrors::NoData);
+    }
 
     let confirmation_byte = [1u8];
 
@@ -381,7 +406,6 @@ pub async fn ipc_recv(
         .await
         .map_err(|_| IpcErrors::FailedToWriteToStream)?;
 
-    let size = u64::from_le_bytes(size_buffer);
     let mut buffer = vec![0u8; size as usize];
 
     debug!(size, "reading message data");
@@ -390,10 +414,9 @@ pub async fn ipc_recv(
         .await
         .map_err(|_| IpcErrors::FailedToReadDataFromStream)?;
 
-    // TODO : HANDLE KEYS CHANGES, DATA SYNCING WITH UI, DATA PASSING TO CONTROLLER IN cesa_conn_system if ac tion type doesnt match
-    match ActionType::from_u8(buffer[0]) {
-        _ => {}
-    }
+    handle_data(buffer, trusted_addrs)
+        .await
+        .map_err(|_| IpcErrors::FailedToHandleData)?;
 
     Ok(())
 }
@@ -417,7 +440,7 @@ pub async fn ipc_recv(
 pub async fn ipc_daemon(
     a_key: Arc<RwLock<[u8; 32]>>,
     d_key: Arc<RwLock<[u8; 32]>>,
-    trusted_addrs: Arc<RwLock<SocketAddr>>,
+    trusted_addrs: Arc<RwLock<Vec<std::net::SocketAddr>>>,
     cancellation_token: CancellationToken,
 ) -> Result<(), IpcErrors> {
     let socket = create_secure_pipe().map_err(|_| IpcErrors::FailedToCreateSecurePipe)?;
@@ -506,7 +529,10 @@ pub fn ipc_send(action_type: ActionType, data: &[u8]) -> Result<(), IpcErrors> {
         return Err(IpcErrors::ConfirmationByteNotReceived);
     }
 
-    debug!(confirmation = buffer[0], "confirmation received, sending message data");
+    debug!(
+        confirmation = buffer[0],
+        "confirmation received, sending message data"
+    );
     stream
         .write_all(&final_data)
         .map_err(|_| IpcErrors::FailedToWriteToStream)?;
@@ -526,6 +552,27 @@ pub fn create_secure_pipe() -> Result<(), IpcErrors> {
     Ok(())
 }
 
+pub async fn handle_data(
+    data: Vec<u8>,
+    trusted_addrs: Arc<RwLock<Vec<std::net::SocketAddr>>>,
+) -> Result<(), IpcErrors> {
+    // TODO : HANDLE KEYS CHANGES, DATA SYNCING WITH UI, DATA PASSING TO CONTROLLER IN cesa_conn_system if ac tion type doesnt match
+    match ActionType::from_u8(data[0]) {
+        Some(ActionType::AddTrustedDevice) => {
+            let mut addr_bytes = [0u8; size_of::<Ipv4Addr>()];
+            addr_bytes.copy_from_slice(&data[1..size_of::<Ipv4Addr>() + 1]);
+
+            let addr = Ipv4Addr::from_octets(addr_bytes);
+            let socket_addr = std::net::SocketAddr::new(std::net::IpAddr::V4(addr), 0000);
+
+            let mut trusted_addrs_lock = trusted_addrs.write().await;
+            trusted_addrs_lock.push(socket_addr);
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -534,8 +581,14 @@ mod tests {
     #[test]
     fn test_action_type_from_u8() {
         assert_eq!(ActionType::from_u8(0x00), Some(ActionType::Default));
-        assert_eq!(ActionType::from_u8(0x01), Some(ActionType::UpdateAuthPassword));
-        assert_eq!(ActionType::from_u8(0x02), Some(ActionType::UpdateDataPassword));
+        assert_eq!(
+            ActionType::from_u8(0x01),
+            Some(ActionType::UpdateAuthPassword)
+        );
+        assert_eq!(
+            ActionType::from_u8(0x02),
+            Some(ActionType::UpdateDataPassword)
+        );
         assert_eq!(ActionType::from_u8(0xFF), None);
         assert_eq!(ActionType::from_u8(0x03), None);
     }
@@ -580,7 +633,11 @@ mod tests {
         ];
 
         for error in errors {
-            assert!(!error.to_string().is_empty(), "Error {:?} produced empty string", error);
+            assert!(
+                !error.to_string().is_empty(),
+                "Error {:?} produced empty string",
+                error
+            );
         }
     }
 
@@ -588,8 +645,14 @@ mod tests {
     #[test]
     fn test_action_type_equality() {
         assert_eq!(ActionType::Default, ActionType::Default);
-        assert_eq!(ActionType::UpdateAuthPassword, ActionType::UpdateAuthPassword);
-        assert_eq!(ActionType::UpdateDataPassword, ActionType::UpdateDataPassword);
+        assert_eq!(
+            ActionType::UpdateAuthPassword,
+            ActionType::UpdateAuthPassword
+        );
+        assert_eq!(
+            ActionType::UpdateDataPassword,
+            ActionType::UpdateDataPassword
+        );
     }
 
     /// Test that ActionType variants are not equal to each other
@@ -597,7 +660,10 @@ mod tests {
     fn test_action_type_inequality() {
         assert_ne!(ActionType::Default, ActionType::UpdateAuthPassword);
         assert_ne!(ActionType::Default, ActionType::UpdateDataPassword);
-        assert_ne!(ActionType::UpdateAuthPassword, ActionType::UpdateDataPassword);
+        assert_ne!(
+            ActionType::UpdateAuthPassword,
+            ActionType::UpdateDataPassword
+        );
     }
 
     /// Test that IpcErrors variants are equal to themselves
@@ -605,7 +671,10 @@ mod tests {
     fn test_ipc_errors_equality() {
         assert_eq!(IpcErrors::UIDNotFound, IpcErrors::UIDNotFound);
         assert_eq!(IpcErrors::FailedToRead, IpcErrors::FailedToRead);
-        assert_eq!(IpcErrors::DaemonAlreadyRunning, IpcErrors::DaemonAlreadyRunning);
+        assert_eq!(
+            IpcErrors::DaemonAlreadyRunning,
+            IpcErrors::DaemonAlreadyRunning
+        );
     }
 
     /// Test that IpcErrors variants are not equal to each other
