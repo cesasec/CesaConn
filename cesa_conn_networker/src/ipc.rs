@@ -12,8 +12,7 @@
 // - Add IPC client functionality
 // - Add IPC daemon functionality
 // - Add Windows support (named pipes)
-// - Add SO_PEERCRED verification by looking at GID and /proc/{pid}/comm
-// - Enchance is_running() by hardcoding process name and GID or add const
+// - Add SO_PEERCRED verification by looking at /proc/{pid}/comm
 
 use std::fmt;
 use std::os::unix::net::SocketAddr;
@@ -139,6 +138,7 @@ pub enum IpcErrors {
     FailedToHandleData,
     DataTooLarge,
     NoData,
+    DaemonIsNotRunning,
 }
 
 impl fmt::Display for IpcErrors {
@@ -172,6 +172,7 @@ impl fmt::Display for IpcErrors {
             Self::FailedToHandleData => "failed to handle data from ipc client",
             Self::DataTooLarge => "data from cllient is too large",
             Self::NoData => "there's no data",
+            Self::DaemonIsNotRunning => "daemon is not running yet",
         };
         write!(f, "{}", msg)
     }
@@ -306,7 +307,7 @@ pub fn process_exists(name: String) -> Result<bool, IpcErrors> {
 pub fn is_running() -> Result<bool, IpcErrors> {
     let path = socket_path().map_err(|_| IpcErrors::FailedToFetchSocketPath)?;
 
-    let proc_name = get_self_name().map_err(|_| IpcErrors::FailedToGetSelfName)?;
+    let proc_name = String::from("cesa_conn_networker");
 
     let process_exists =
         process_exists(proc_name).map_err(|_| IpcErrors::FailedToCheckIfProcessExists)?;
@@ -499,8 +500,10 @@ use std::os::unix::net::UnixStream;
 pub fn ipc_send(action_type: ActionType, data: &[u8]) -> Result<(), IpcErrors> {
     let path = socket_path().map_err(|_| IpcErrors::FailedToFetchSocketPath)?;
 
-    if !Path::new(&path).exists() {
-        return Err(IpcErrors::PipeNotCreated);
+    let is_daemon_running = is_running().map_err(|_| IpcErrors::FailedToCheckIfRunning)?;
+
+    if !is_daemon_running {
+        return Err(IpcErrors::DaemonIsNotRunning);
     }
 
     debug!(action_type = ?action_type, data_len = data.len(), "connecting to IPC daemon");
