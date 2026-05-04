@@ -12,10 +12,25 @@
 // - Add IPC client functionality
 // - Add IPC daemon functionality
 // - Add Windows support (named pipes)
-// - Add SO_PEERCRED verification by looking at /proc/{pid}/comm
+// TODO LATER:
+// - Add SELinux / AppArmor policy support for better security
+
+/// List of trusted process names that are allowed to connect to the IPC daemon
+///
+/// This constant defines which processes are authorized to communicate with
+/// the IPC daemon. Peer verification is performed using SO_PEERCRED to ensure
+/// that only trusted processes can connect.
+///
+/// # Security Note
+/// This list should be kept minimal and only include processes that have a
+/// legitimate need to communicate with the daemon. Adding untrusted processes
+/// could lead to security vulnerabilities.
+const TRUSTED_PROCESSES: &[&str] = &[
+    "cesa_conn_tui",
+    "cesa_conn_gui",
+];
 
 use std::fmt;
-use std::os::unix::net::SocketAddr;
 use std::{
     fs::{Permissions, read_dir, read_to_string, remove_file, set_permissions},
     path::Path,
@@ -29,13 +44,12 @@ use std::{
 use std::{net::Ipv4Addr, os::unix::fs::PermissionsExt};
 use tokio::select;
 #[cfg(unix)]
-use tokio::task::spawn_blocking;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     sync::RwLock,
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 /// Action types for IPC messages
 ///
@@ -51,7 +65,9 @@ pub enum ActionType {
     UpdateAuthPassword = 0x01,
     /// Request to update the data encryption password
     UpdateDataPassword = 0x02,
+    /// Request to add a new trusted device
     AddTrustedDevice = 0x03,
+    /// Request to synchronize data with other devices
     SyncData = 0x04,
 }
 
@@ -135,10 +151,24 @@ pub enum IpcErrors {
     ConfirmationByteNotReceived,
     /// Failed to get data from client
     FailedToRecvData,
+    /// Failed to handle data from ipc client
     FailedToHandleData,
+    /// Data from client is too large
     DataTooLarge,
+    /// No data received
     NoData,
+    /// Daemon is not running yet
     DaemonIsNotRunning,
+    /// Failed to get peer credentials
+    FailedToGetPeerCred,
+    /// Failed to get process pid
+    FailedToGetPid,
+    /// Failed to get process name
+    FailedToGetProcessName,
+    /// Failed to get peer name
+    FailedToGetPeerName,
+    /// Unauthorized peer tried to connect
+    UnauthorizedPeer,
 }
 
 impl fmt::Display for IpcErrors {
@@ -173,6 +203,11 @@ impl fmt::Display for IpcErrors {
             Self::DataTooLarge => "data from cllient is too large",
             Self::NoData => "there's no data",
             Self::DaemonIsNotRunning => "daemon is not running yet",
+            Self::FailedToGetPeerCred => "failed to get peer cred",
+            Self::FailedToGetPid => "failed to get process pid",
+            Self::FailedToGetProcessName => "failed to get process name",
+            Self::FailedToGetPeerName => "failed to get peer name",
+            Self::UnauthorizedPeer => "unauthorized peer tired to connect",
         };
         write!(f, "{}", msg)
     }
@@ -307,17 +342,57 @@ pub fn process_exists(name: String) -> Result<bool, IpcErrors> {
 pub fn is_running() -> Result<bool, IpcErrors> {
     let path = socket_path().map_err(|_| IpcErrors::FailedToFetchSocketPath)?;
 
+    // Use hardcoded process name for reliable daemon detection
     let proc_name = String::from("cesa_conn_networker");
+
+    debug!(socket_path = %path, proc_name = %proc_name, "checking if daemon is running");
 
     let process_exists =
         process_exists(proc_name).map_err(|_| IpcErrors::FailedToCheckIfProcessExists)?;
 
     if Path::new(&path).exists() {
         if process_exists {
+            info!("daemon is running (socket exists and process found)");
             return Ok(true);
+        } else {
+            warn!("socket exists but process not found, stale socket");
         }
     }
+
+    debug!("daemon is not running");
     Ok(false)
+}
+
+/// Gets the name of the peer process connected to the Unix socket
+///
+/// This function uses SO_PEERCRED to get the peer's credentials and then
+/// looks up the process name from /proc/{pid}/comm.
+///
+/// # Arguments
+/// * `connection` - &tokio::net::UnixStream - The Unix stream connection
+///
+/// # Returns
+/// * `Ok(String)` - The peer process name
+/// * `Err(IpcErrors)` - If getting peer credentials or process name fails
+#[cfg(unix)]
+fn get_peer_name(connection: &tokio::net::UnixStream) -> Result<String, IpcErrors> {
+    debug!("getting peer credentials using SO_PEERCRED");
+
+    let ucreed = connection
+        .peer_cred()
+        .map_err(|_| IpcErrors::FailedToGetPeerCred)?;
+
+    let pid = ucreed
+        .pid()
+        .ok_or(IpcErrors::FailedToGetPid)?;
+
+    debug!(peer_pid = pid, "looking up peer process name");
+
+    let peer_name = get_process_name(pid.to_string()).map_err(|_| IpcErrors::FailedToGetProcessName)?;
+
+    debug!(peer_pid = pid, peer_name = %peer_name, "peer name retrieved");
+
+    Ok(peer_name)
 }
 
 /// Creates a secure Unix domain socket for IPC communication
@@ -325,6 +400,11 @@ pub fn is_running() -> Result<bool, IpcErrors> {
 /// This function creates a Unix domain socket with restricted permissions (0o600)
 /// for secure inter-process communication. It checks if a daemon is already
 /// running and returns an error if so.
+///
+/// # Security Considerations
+/// - Socket permissions are set to 0o600 (owner read/write only)
+/// - Stale socket files are cleaned up before creating new ones
+/// - Daemon running check prevents multiple instances
 ///
 /// # Returns
 /// * `Ok(UnixListener)` - The bound socket listener ready to accept connections
@@ -334,20 +414,29 @@ use tokio::net::UnixListener;
 pub fn create_secure_pipe() -> Result<UnixListener, IpcErrors> {
     let path = socket_path().map_err(|_| IpcErrors::FailedToFetchSocketPath)?;
 
+    debug!(socket_path = %path, "checking if daemon is already running");
+
     let is_daemon_running = is_running().map_err(|_| IpcErrors::FailedToCheckIfRunning)?;
 
     if !is_daemon_running {
         if Path::new(&path).exists() {
+            info!(socket_path = %path, "removing stale socket file");
             remove_file(&path).map_err(|_| IpcErrors::FailedToRemoveFile)?;
         }
     } else {
+        warn!("daemon is already running, cannot create new socket");
         return Err(IpcErrors::DaemonAlreadyRunning);
     }
 
+    info!(socket_path = %path, "creating new Unix domain socket");
+
     let socket = UnixListener::bind(&path).map_err(|_| IpcErrors::FailedToBindSocket)?;
 
+    debug!(socket_path = %path, "setting socket permissions to 0o600");
     set_permissions(&path, Permissions::from_mode(0o600))
         .map_err(|_| IpcErrors::FailedToSetPermissions)?;
+
+    info!(socket_path = %path, "secure pipe created successfully");
 
     Ok(socket)
 }
@@ -356,15 +445,16 @@ pub fn create_secure_pipe() -> Result<UnixListener, IpcErrors> {
 ///
 /// This function handles incoming IPC connections, reads the message,
 /// and processes it based on the action type. The protocol is:
-/// 1. Read 8-byte size prefix
-/// 2. Send confirmation byte (0x01)
-/// 3. Read the actual message data
-/// 4. Process based on action type
+/// 1. Verify peer identity using SO_PEERCRED
+/// 2. Read 8-byte size prefix
+/// 3. Send confirmation byte (0x01)
+/// 4. Read the actual message data
+/// 5. Process based on action type
 ///
 /// # Arguments
 /// * `a_key` - Arc<RwLock<[u8; 32]>> - Authentication key (shared reference)
 /// * `d_key` - Arc<RwLock<[u8; 32]>> - Data encryption key (shared reference)
-/// * `trusted_addrs` - Arc<RwLock<SocketAddr>> - Trusted socket addresses
+/// * `trusted_addrs` - Arc<RwLock<Vec<std::net::SocketAddr>>> - Trusted socket addresses
 /// * `incoming_connection` - Tuple of (UnixStream, SocketAddr) for the connection
 ///
 /// # Returns
@@ -379,7 +469,17 @@ pub async fn ipc_recv(
 ) -> Result<(), IpcErrors> {
     let (mut stream, _addr) = incoming_connection;
 
-    debug!("IPC connection received, reading message size");
+    // Verify peer identity using SO_PEERCRED for security
+    let peer_name = get_peer_name(&stream).map_err(|_| IpcErrors::FailedToGetPeerName)?;
+
+    debug!(peer_name = %peer_name, "Verifying peer identity");
+
+    if !TRUSTED_PROCESSES.contains(&peer_name.as_str()) {
+        warn!(peer_name = %peer_name, "Unauthorized peer attempted to connect");
+        return Err(IpcErrors::UnauthorizedPeer);
+    }
+
+    info!(peer_name = %peer_name, "Authorized peer connected, reading message size");
 
     let mut size_buffer = [0u8; 8];
     stream
@@ -387,16 +487,19 @@ pub async fn ipc_recv(
         .await
         .map_err(|_| IpcErrors::FailedToReadDataFromStream)?;
 
-    debug!(
-        size = u64::from_le_bytes(size_buffer),
-        "message size read, sending confirmation"
-    );
-
     let size = u64::from_le_bytes(size_buffer);
 
+    debug!(
+        size,
+        "message size read, validating and sending confirmation"
+    );
+
+    // Validate message size to prevent DoS attacks
     if size > 64 * 1024 {
+        warn!(size, "Message too large, rejecting");
         return Err(IpcErrors::DataTooLarge);
     } else if size == 0 {
+        warn!("Empty message received, rejecting");
         return Err(IpcErrors::NoData);
     }
 
@@ -407,13 +510,15 @@ pub async fn ipc_recv(
         .await
         .map_err(|_| IpcErrors::FailedToWriteToStream)?;
 
+    debug!(size, "reading message data");
     let mut buffer = vec![0u8; size as usize];
 
-    debug!(size, "reading message data");
     stream
         .read_exact(&mut buffer)
         .await
         .map_err(|_| IpcErrors::FailedToReadDataFromStream)?;
+
+    debug!(data_len = buffer.len(), "message data received, processing");
 
     handle_data(buffer, trusted_addrs)
         .await
@@ -428,10 +533,15 @@ pub async fn ipc_recv(
 /// and spawning async tasks to handle each one. It supports graceful
 /// shutdown via cancellation token.
 ///
+/// # Architecture
+/// - Each connection is handled in a separate async task
+/// - Cancellation token allows graceful shutdown
+/// - Peer verification is performed before accepting connections
+///
 /// # Arguments
 /// * `a_key` - Arc<RwLock<[u8; 32]>> - Authentication key (shared reference)
 /// * `d_key` - Arc<RwLock<[u8; 32]>> - Data encryption key (shared reference)
-/// * `trusted_addrs` - Arc<RwLock<SocketAddr>> - Trusted socket addresses
+/// * `trusted_addrs` - Arc<RwLock<Vec<std::net::SocketAddr>>> - Trusted socket addresses
 /// * `cancellation_token` - CancellationToken for graceful shutdown
 ///
 /// # Returns
@@ -452,9 +562,11 @@ pub async fn ipc_daemon(
         let (a_key_clone, d_key_clone) = (a_key.clone(), d_key.clone());
         let trusted_addrs_clone = trusted_addrs.clone();
 
+        debug!("waiting for incoming IPC connection or cancellation signal");
+
         let incoming_connection = select! {
             _ = cancellation_token.cancelled() => {
-                info!("IPC daemon shutting down");
+                info!("IPC daemon shutting down gracefully");
                 return Ok(());
             }
             result = socket.accept() => {
@@ -483,10 +595,11 @@ pub async fn ipc_daemon(
 /// Sends an IPC message to the daemon
 ///
 /// This function sends a message to the IPC daemon using the following protocol:
-/// 1. Connect to the socket
-/// 2. Send message size (8 bytes)
-/// 3. Wait for confirmation byte
-/// 4. Send the actual message data
+/// 1. Check if daemon is running
+/// 2. Connect to the socket
+/// 3. Send message size (8 bytes)
+/// 4. Wait for confirmation byte
+/// 5. Send the actual message data
 ///
 /// # Arguments
 /// * `action_type` - ActionType - The type of action being requested
@@ -500,13 +613,16 @@ use std::os::unix::net::UnixStream;
 pub fn ipc_send(action_type: ActionType, data: &[u8]) -> Result<(), IpcErrors> {
     let path = socket_path().map_err(|_| IpcErrors::FailedToFetchSocketPath)?;
 
+    debug!("Checking if IPC daemon is running");
+
     let is_daemon_running = is_running().map_err(|_| IpcErrors::FailedToCheckIfRunning)?;
 
     if !is_daemon_running {
+        warn!("IPC daemon is not running, cannot send message");
         return Err(IpcErrors::DaemonIsNotRunning);
     }
 
-    debug!(action_type = ?action_type, data_len = data.len(), "connecting to IPC daemon");
+    info!(action_type = ?action_type, data_len = data.len(), "connecting to IPC daemon");
 
     let mut stream = UnixStream::connect(path).map_err(|_| IpcErrors::FailedToConnectToPipe)?;
     let mut final_data = Vec::with_capacity(data.len() + 1);
@@ -521,7 +637,7 @@ pub fn ipc_send(action_type: ActionType, data: &[u8]) -> Result<(), IpcErrors> {
         .write_all(&len)
         .map_err(|_| IpcErrors::FailedToWriteToStream)?;
 
-    debug!("waiting for confirmation byte");
+    debug!("waiting for confirmation byte from daemon");
     let mut buffer = [0u8];
 
     stream
@@ -529,6 +645,7 @@ pub fn ipc_send(action_type: ActionType, data: &[u8]) -> Result<(), IpcErrors> {
         .map_err(|_| IpcErrors::FailedToReadDataFromStream)?;
 
     if buffer[0] == 0x00 {
+        error!("Received 0x00 confirmation byte, daemon rejected message");
         return Err(IpcErrors::ConfirmationByteNotReceived);
     }
 
@@ -539,6 +656,8 @@ pub fn ipc_send(action_type: ActionType, data: &[u8]) -> Result<(), IpcErrors> {
     stream
         .write_all(&final_data)
         .map_err(|_| IpcErrors::FailedToWriteToStream)?;
+
+    info!(action_type = ?action_type, "message sent successfully to IPC daemon");
 
     Ok(())
 }
@@ -555,6 +674,26 @@ pub fn create_secure_pipe() -> Result<(), IpcErrors> {
     Ok(())
 }
 
+/// Handles incoming IPC data based on the action type
+///
+/// This function processes received IPC messages and performs the appropriate
+/// action based on the action type specified in the first byte of the data.
+///
+/// # Arguments
+/// * `data` - Vec<u8> - The received data (first byte is action type)
+/// * `trusted_addrs` - Arc<RwLock<Vec<std::net::SocketAddr>>> - Shared list of trusted addresses
+///
+/// # Returns
+/// * `Ok(())` - Data handled successfully
+/// * `Err(IpcErrors)` - If handling fails
+///
+/// # Supported Actions
+/// - `AddTrustedDevice` (0x03): Adds a new trusted device address from bytes 1-5
+/// - `SyncData` (0x04): Synchronizes data with other devices (not yet implemented)
+/// - `UpdateAuthPassword` (0x01): Updates authentication password (not yet implemented)
+/// - `UpdateDataPassword` (0x02): Updates data encryption password (not yet implemented)
+/// - `Default` (0x00): No operation performed
+/// - Unknown values: Ignored with warning
 pub async fn handle_data(
     data: Vec<u8>,
     trusted_addrs: Arc<RwLock<Vec<std::net::SocketAddr>>>,
@@ -562,16 +701,40 @@ pub async fn handle_data(
     // TODO : HANDLE KEYS CHANGES, DATA SYNCING WITH UI, DATA PASSING TO CONTROLLER IN cesa_conn_system if ac tion type doesnt match
     match ActionType::from_u8(data[0]) {
         Some(ActionType::AddTrustedDevice) => {
+            debug!("Processing AddTrustedDevice action");
+
+            // Extract IPv4 address from data (bytes 1-5)
             let mut addr_bytes = [0u8; size_of::<Ipv4Addr>()];
             addr_bytes.copy_from_slice(&data[1..size_of::<Ipv4Addr>() + 1]);
 
             let addr = Ipv4Addr::from_octets(addr_bytes);
             let socket_addr = std::net::SocketAddr::new(std::net::IpAddr::V4(addr), 0000);
 
+            debug!(%addr, "Adding new trusted device address");
+
             let mut trusted_addrs_lock = trusted_addrs.write().await;
             trusted_addrs_lock.push(socket_addr);
+
+            info!(%addr, "Successfully added trusted device");
         }
-        _ => {}
+        Some(ActionType::SyncData) => {
+            debug!("Processing SyncData action (not yet implemented)");
+            // TODO: Implement data synchronization
+        }
+        Some(ActionType::UpdateAuthPassword) => {
+            debug!("Processing UpdateAuthPassword action (not yet implemented)");
+            // TODO: Implement auth password update
+        }
+        Some(ActionType::UpdateDataPassword) => {
+            debug!("Processing UpdateDataPassword action (not yet implemented)");
+            // TODO: Implement data password update
+        }
+        Some(ActionType::Default) => {
+            debug!("Received Default action (no operation)");
+        }
+        None => {
+            warn!(action_byte = data[0], "Received unknown action type, ignoring");
+        }
     }
     Ok(())
 }
@@ -592,8 +755,13 @@ mod tests {
             ActionType::from_u8(0x02),
             Some(ActionType::UpdateDataPassword)
         );
+        assert_eq!(
+            ActionType::from_u8(0x03),
+            Some(ActionType::AddTrustedDevice)
+        );
+        assert_eq!(ActionType::from_u8(0x04), Some(ActionType::SyncData));
         assert_eq!(ActionType::from_u8(0xFF), None);
-        assert_eq!(ActionType::from_u8(0x03), None);
+        assert_eq!(ActionType::from_u8(0x05), None);
     }
 
     /// Test that ActionType enum values match their repr(u8) values
@@ -602,6 +770,8 @@ mod tests {
         assert_eq!(ActionType::Default as u8, 0x00);
         assert_eq!(ActionType::UpdateAuthPassword as u8, 0x01);
         assert_eq!(ActionType::UpdateDataPassword as u8, 0x02);
+        assert_eq!(ActionType::AddTrustedDevice as u8, 0x03);
+        assert_eq!(ActionType::SyncData as u8, 0x04);
     }
 
     /// Test that all IpcErrors variants produce non-empty Display strings
@@ -633,6 +803,15 @@ mod tests {
             IpcErrors::FailedToReadDataFromStream,
             IpcErrors::ConfirmationByteNotReceived,
             IpcErrors::FailedToRecvData,
+            IpcErrors::FailedToHandleData,
+            IpcErrors::DataTooLarge,
+            IpcErrors::NoData,
+            IpcErrors::DaemonIsNotRunning,
+            IpcErrors::FailedToGetPeerCred,
+            IpcErrors::FailedToGetPid,
+            IpcErrors::FailedToGetProcessName,
+            IpcErrors::FailedToGetPeerName,
+            IpcErrors::UnauthorizedPeer,
         ];
 
         for error in errors {
@@ -696,6 +875,8 @@ mod tests {
             ActionType::Default => "default",
             ActionType::UpdateAuthPassword => "auth",
             ActionType::UpdateDataPassword => "data",
+            ActionType::AddTrustedDevice => "add_device",
+            ActionType::SyncData => "sync",
         };
         assert_eq!(result, "auth");
     }
@@ -715,6 +896,8 @@ mod tests {
             ActionType::Default,
             ActionType::UpdateAuthPassword,
             ActionType::UpdateDataPassword,
+            ActionType::AddTrustedDevice,
+            ActionType::SyncData,
         ];
 
         for action in actions {
@@ -794,5 +977,128 @@ mod tests {
         // Since we can't test for non-compilation, we just verify
         // that we can use Debug instead
         let _ = format!("{:?}", action);
+    }
+
+    /// Test that new action types (AddTrustedDevice, SyncData) work correctly
+    #[test]
+    fn test_new_action_types() {
+        assert_eq!(ActionType::from_u8(0x03), Some(ActionType::AddTrustedDevice));
+        assert_eq!(ActionType::from_u8(0x04), Some(ActionType::SyncData));
+        assert_eq!(ActionType::AddTrustedDevice as u8, 0x03);
+        assert_eq!(ActionType::SyncData as u8, 0x04);
+    }
+
+    /// Test that new error types produce valid Display strings
+    #[test]
+    fn test_new_error_types_display() {
+        let new_errors = vec![
+            IpcErrors::FailedToGetPeerCred,
+            IpcErrors::FailedToGetPid,
+            IpcErrors::FailedToGetProcessName,
+            IpcErrors::FailedToGetPeerName,
+            IpcErrors::UnauthorizedPeer,
+        ];
+
+        for error in new_errors {
+            assert!(!error.to_string().is_empty());
+        }
+    }
+
+    /// Test that DaemonIsNotRunning error works correctly
+    #[test]
+    fn test_daemon_is_not_running_error() {
+        let error = IpcErrors::DaemonIsNotRunning;
+        let display_str = error.to_string();
+        assert!(display_str.contains("not running"));
+    }
+
+    /// Test that DataTooLarge and NoData errors work correctly
+    #[test]
+    fn test_data_validation_errors() {
+        let too_large = IpcErrors::DataTooLarge;
+        let no_data = IpcErrors::NoData;
+
+        assert!(!too_large.to_string().is_empty());
+        assert!(!no_data.to_string().is_empty());
+    }
+
+    /// Test that all action types are covered in roundtrip
+    #[test]
+    fn test_all_action_types_roundtrip() {
+        let all_actions = [
+            ActionType::Default,
+            ActionType::UpdateAuthPassword,
+            ActionType::UpdateDataPassword,
+            ActionType::AddTrustedDevice,
+            ActionType::SyncData,
+        ];
+
+        for action in all_actions {
+            let byte = action as u8;
+            let converted = ActionType::from_u8(byte);
+            assert_eq!(converted, Some(action), "Failed for action: {:?}", action);
+        }
+    }
+
+    /// Test that ActionType variants are not equal to each other (including new types)
+    #[test]
+    fn test_action_type_inequality_extended() {
+        assert_ne!(ActionType::Default, ActionType::AddTrustedDevice);
+        assert_ne!(ActionType::Default, ActionType::SyncData);
+        assert_ne!(ActionType::UpdateAuthPassword, ActionType::AddTrustedDevice);
+        assert_ne!(ActionType::UpdateAuthPassword, ActionType::SyncData);
+        assert_ne!(ActionType::UpdateDataPassword, ActionType::AddTrustedDevice);
+        assert_ne!(ActionType::UpdateDataPassword, ActionType::SyncData);
+        assert_ne!(ActionType::AddTrustedDevice, ActionType::SyncData);
+    }
+
+    /// Test that all IpcErrors variants are unique
+    #[test]
+    fn test_all_ipc_errors_unique() {
+        let all_errors = [
+            IpcErrors::UIDNotFound,
+            IpcErrors::FailedToRead,
+            IpcErrors::FailedToGetUID,
+            IpcErrors::FailedToFetchSocketPath,
+            IpcErrors::FailedToReadprocessDirectory,
+            IpcErrors::FailedToFilterMap,
+            IpcErrors::FailedToFechProcesses,
+            IpcErrors::FailedToGetSelfName,
+            IpcErrors::FailedToReadProcessName,
+            IpcErrors::FailedToCheckIfProcessExists,
+            IpcErrors::FailedToRemoveFile,
+            IpcErrors::FailedToBindSocket,
+            IpcErrors::FailedToSetPermissions,
+            IpcErrors::DaemonAlreadyRunning,
+            IpcErrors::FailedToCheckIfRunning,
+            IpcErrors::FailedToConnectToPipe,
+            IpcErrors::FailedToCheckStreamState,
+            IpcErrors::NotWritable,
+            IpcErrors::FailedToWriteToStream,
+            IpcErrors::PipeNotCreated,
+            IpcErrors::FailedToCreateSecurePipe,
+            IpcErrors::FailedToAcceptConnection,
+            IpcErrors::FailedToReadDataFromStream,
+            IpcErrors::ConfirmationByteNotReceived,
+            IpcErrors::FailedToRecvData,
+            IpcErrors::FailedToHandleData,
+            IpcErrors::DataTooLarge,
+            IpcErrors::NoData,
+            IpcErrors::DaemonIsNotRunning,
+            IpcErrors::FailedToGetPeerCred,
+            IpcErrors::FailedToGetPid,
+            IpcErrors::FailedToGetProcessName,
+            IpcErrors::FailedToGetPeerName,
+            IpcErrors::UnauthorizedPeer,
+        ];
+
+        // Verify all errors are unique by checking that no two are equal
+        for (i, error1) in all_errors.iter().enumerate() {
+            for (j, error2) in all_errors.iter().enumerate() {
+                if i != j {
+                    assert_ne!(error1, error2, "Errors at indices {} and {} are equal", i, j);
+                }
+            }
+        }
     }
 }
